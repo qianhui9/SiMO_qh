@@ -62,7 +62,7 @@ python opencood/tools/inference.py \
 
 ```bash
 python opencood/tools/inference.py \
-  --model_dir saved_models/opv2v_lidarcamera_lamma3_pyramid_fusion/ \
+  --model_dir saved_models/SiMO-PF \
   --fusion_method intermediate \
   --light_sad_enable \
   --light_sad_force_action L \
@@ -74,7 +74,7 @@ python opencood/tools/inference.py \
 
 ```bash
 python opencood/tools/inference.py \
-  --model_dir saved_models/opv2v_lidarcamera_lamma3_pyramid_fusion/ \
+  --model_dir saved_models/SiMO-PF \
   --fusion_method intermediate \
   --light_sad_enable \
   --light_sad_force_action C \
@@ -86,7 +86,7 @@ python opencood/tools/inference.py \
 
 ```bash
 python opencood/tools/inference.py \
-  --model_dir saved_models/opv2v_lidarcamera_lamma3_pyramid_fusion/ \
+  --model_dir saved_models/SiMO-PF \
   --fusion_method intermediate \
   --light_sad_enable \
   --light_sad_force_action LC \
@@ -98,7 +98,7 @@ python opencood/tools/inference.py \
 
 ```bash
 python opencood/tools/inference.py \
-  --model_dir saved_models/opv2v_lidarcamera_lamma3_pyramid_fusion/ \
+  --model_dir saved_models/SiMO-PF \
   --fusion_method intermediate \
   --light_sad_enable \
   --light_sad_log \
