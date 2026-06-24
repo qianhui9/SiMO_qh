@@ -33,20 +33,27 @@ class LightSADDispatcher:
             state["per_cav"]["local_reliability"] = local
 
         total = total_cavs(record_len)
-        global_action, global_reason = self.decide_action(self._global_state(state))
+        global_state = self._global_state(state)
+        global_action, global_reason = self.decide_action(global_state)
         result = {
             "action": global_action,
             "reason": global_reason,
             "state": state,
             "mode": "batch",
+            "reliability": self._estimate_reliability(global_action, global_state),
         }
 
         if self.cfg.force_actions:
             actions = expand_actions(self.cfg.force_actions, total)
+            cav_states = self._per_cav_states(state, total)
             result.update({
                 "actions": actions,
                 "reasons": ["force_actions_%s" % act for act in actions],
-                "states": self._per_cav_states(state, total),
+                "states": cav_states,
+                "reliabilities": [
+                    self._estimate_reliability(action, cav_state)
+                    for action, cav_state in zip(actions, cav_states)
+                ],
                 "mode": "per_cav",
                 "action": self._aggregate_actions(actions),
                 "reason": "force_actions",
@@ -63,6 +70,10 @@ class LightSADDispatcher:
                     "actions": actions,
                     "reasons": reasons,
                     "states": cav_states,
+                    "reliabilities": [
+                        self._estimate_reliability(action, cav_state)
+                        for action, cav_state in zip(actions, cav_states)
+                    ],
                     "mode": "per_cav",
                     "action": self._aggregate_actions(actions),
                     "reason": "per_cav_%s" % self._aggregate_actions(actions),
@@ -179,6 +190,61 @@ class LightSADDispatcher:
         if all(action == actions[0] for action in actions):
             return actions[0]
         return "LC"
+
+    def _estimate_reliability(self, action: str, state: dict) -> float:
+        lidar = state.get("lidar", {}) if isinstance(state, dict) else {}
+        camera = state.get("camera", {}) if isinstance(state, dict) else {}
+        history = state.get("history", {}) if isinstance(state, dict) else {}
+        local = state.get("local_reliability", {}) if isinstance(state, dict) else {}
+
+        lidar_rel = self._lidar_reliability(lidar, local)
+        camera_rel = self._camera_reliability(camera, local)
+        history_rel = self._history_reliability(history)
+
+        action = str(action or "LC").upper()
+        if action == "L":
+            base = lidar_rel
+        elif action == "C":
+            base = camera_rel
+        else:
+            base = 0.45 * lidar_rel + 0.45 * camera_rel + 0.10 * max(lidar_rel, camera_rel)
+
+        return float(max(0.0, min(1.0, 0.85 * base + 0.15 * history_rel)))
+
+    def _lidar_reliability(self, lidar: dict, local: dict) -> float:
+        if not bool(lidar.get("valid", False)):
+            return 0.35
+        points = float(lidar.get("num_points", 0.0))
+        voxels = float(lidar.get("num_voxels", 0.0))
+        mean_points = float(lidar.get("mean_points_per_voxel", 0.0))
+        sparse = float(lidar.get("distant_sparse_score", 0.0))
+        point_score = min(points / max(float(self.cfg.lidar_good_points), 1.0), 1.0)
+        voxel_score = min(voxels / max(float(self.cfg.lidar_min_voxels), 1.0), 1.0)
+        density_score = min(mean_points / 5.0, 1.0)
+        rel = 0.35 * point_score + 0.30 * voxel_score + 0.25 * density_score + 0.10 * (1.0 - min(sparse, 1.0))
+        local_summary = local.get("summary", local) if isinstance(local, dict) else {}
+        if local_summary:
+            rel *= 1.0 - 0.35 * min(float(local_summary.get("low_lidar_region_ratio", 0.0)), 1.0)
+        return float(max(0.0, min(1.0, rel)))
+
+    def _camera_reliability(self, camera: dict, local: dict) -> float:
+        if not bool(camera.get("valid", False)):
+            return 0.35
+        dark = min(float(camera.get("dark_score", 0.0)), 1.0)
+        blur = min(float(camera.get("blur_proxy", 0.0)) / max(float(self.cfg.camera_blur_thr), 1.0e-6), 1.0)
+        contrast = min(float(camera.get("contrast", 0.0)) / max(float(self.cfg.camera_good_brightness_thr), 1.0e-6), 1.0)
+        rel = 0.35 * (1.0 - dark) + 0.35 * blur + 0.30 * contrast
+        local_summary = local.get("summary", local) if isinstance(local, dict) else {}
+        if local_summary and bool(local_summary.get("camera_reliable_flag", False)):
+            rel = max(rel, 0.75)
+        return float(max(0.0, min(1.0, rel)))
+
+    @staticmethod
+    def _history_reliability(history: dict) -> float:
+        if not isinstance(history, dict) or not bool(history.get("valid", False)):
+            return 1.0
+        score = float(history.get("last_topk_mean_score", history.get("last_mean_score", 0.5)))
+        return float(max(0.0, min(1.0, score)))
 
     def _state_summary(self, result: dict) -> dict:
         actions = result.get("actions", [result.get("action", "LC")])

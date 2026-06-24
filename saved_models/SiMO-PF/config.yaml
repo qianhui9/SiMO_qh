@@ -189,6 +189,43 @@ model:
       random_drop: false # should be false in inference
       lidar_drop_ratio: 0.5 # useless when not singel_mode
 
+    sd_lamma:
+      enabled: false
+      demand:
+        use_lidar_density: true
+        use_uncertainty: true
+        use_history: false
+        use_occlusion: false
+        density_threshold: 0.125
+        uncertainty_threshold: 0.5
+        topk_ratio: null
+        density_weight: 0.35
+        uncertainty_weight: 0.55
+        history_weight: 0.10
+      supply:
+        confidence_threshold: 0.01
+        topk_ratio: null
+        use_modality_reliability: true
+        min_reliability: 0.0
+      network:
+        budget_mode: "threshold"
+        max_comm_ratio: null
+        bandwidth_mbps: null
+        latency_ms: null
+        packet_loss: null
+      redundancy:
+        enabled: true
+        demand_decay: 1.0
+        allow_overlap: false
+      mask:
+        dense_zero_mask: true
+        multiscale: true
+        align_corners: false
+      debug:
+        log: false
+        max_batches: 5
+        save_masks: false
+
     # ma_fusion_method: att 
     # att:
     #   feat_dim: 256

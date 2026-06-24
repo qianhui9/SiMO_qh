@@ -40,18 +40,18 @@ def test_parser():
     parser.add_argument('--no_score', action='store_true',
                         help="whether print the score of prediction")
     parser.add_argument('--note', default="", type=str, help="any other thing?")
-    parser.add_argument("--light_sad_enable", action="store_true",
+    parser.add_argument("--light_sad_enable", action="store_true",    # 启用 Light-SAD 调度器
                         help="Enable Light-SAD runtime modality scheduler.")
     parser.add_argument("--light_sad_force_action", default=None,
                         choices=["L", "C", "LC"],
                         help="Force Light-SAD action for smoke test.")
-    parser.add_argument("--light_sad_log", action="store_true",
+    parser.add_argument("--light_sad_log", action="store_true",   # 打印每帧调度动作和原因
                         help="Print Light-SAD action and reason.")
-    parser.add_argument("--light_sad_per_cav", action="store_true",
+    parser.add_argument("--light_sad_per_cav", action="store_true",   # 启用 per-CAV 调度，也就是为每个协作车辆分别输出 L / C / LC
                         help="Enable per-CAV Light-SAD scheduling.")
-    parser.add_argument("--light_sad_use_history", action="store_true",
+    parser.add_argument("--light_sad_use_history", action="store_true",  # 启用历史检测置信度。当前帧推理结束后，用 pred_score 更新 history buffer，下一帧调度时再使用
                         help="Use previous-frame detection score history for Light-SAD.")
-    parser.add_argument("--light_sad_use_local_reliability", action="store_true",
+    parser.add_argument("--light_sad_use_local_reliability", action="store_true",  # 启用局部可靠性代理，根据 LiDAR voxel 分布和 Camera 质量构造粗粒度 BEV reliability map
                         help="Use coarse local reliability summaries for Light-SAD.")
     parser.add_argument("--light_sad_policy", default="emc2_rule",
                         choices=["force", "emc2_rule", "emc2_rule_history", "emc2_rule_local", "emc2_rule_full"],
@@ -62,8 +62,27 @@ def test_parser():
                         help="Dump Light-SAD state/debug summaries as JSONL.")
     parser.add_argument("--light_sad_dump_path", default=None,
                         help="Path for --light_sad_dump_state JSONL output.")
-    parser.add_argument("--light_sad_max_batches", type=int, default=None,
+    parser.add_argument("--light_sad_max_batches", type=int, default=None,   # 只跑前 5 个 batch，做 smoke test
                         help="Optional smoke-test limit.")
+    parser.add_argument("--sd_lamma_enable", action="store_true",
+                        help="Enable SD-LAMMA supply-demand communication masks.")
+    parser.add_argument("--sd_lamma_log", action="store_true",
+                        help="Print SD-LAMMA demand/supply/communication summaries.")
+    parser.add_argument("--sd_lamma_budget_mode", default=None,
+                        choices=["threshold", "topk"],
+                        help="Override SD-LAMMA network budget mode.")
+    parser.add_argument("--sd_lamma_max_comm_ratio", type=float, default=None,
+                        help="Optional max selected communication ratio across collaborator BEV cells.")
+    parser.add_argument("--sd_lamma_demand_topk_ratio", type=float, default=None,
+                        help="Optional top-k ratio for ego demand mask generation.")
+    parser.add_argument("--sd_lamma_supply_threshold", type=float, default=None,
+                        help="Optional threshold for collaborator supply confidence.")
+    parser.add_argument("--sd_lamma_no_redundancy", action="store_true",
+                        help="Disable CodeFilling-style remaining-demand de-duplication.")
+    parser.add_argument("--sd_lamma_allow_overlap", action="store_true",
+                        help="Allow multiple collaborators to fill the same ego BEV region.")
+    parser.add_argument("--sd_lamma_save_masks", action="store_true",
+                        help="Attach SD-LAMMA demand/supply/selection masks to model debug output.")
     opt = parser.parse_args()
     return opt
 
@@ -133,6 +152,32 @@ def main():
         model_args["light_sad"]["use_local_reliability"] = opt.light_sad_use_local_reliability
         model_args["light_sad"]["debug_dump_state"] = opt.light_sad_dump_state
         model_args["light_sad"]["debug_dump_path"] = opt.light_sad_dump_path
+
+    if opt.sd_lamma_enable:
+        model_args = hypes["model"]["args"]
+        sd_cfg = model_args.get("sd_lamma", {})
+        model_args["sd_lamma"] = sd_cfg
+        sd_cfg["enabled"] = True
+        sd_cfg.setdefault("network", {})
+        sd_cfg.setdefault("demand", {})
+        sd_cfg.setdefault("supply", {})
+        sd_cfg.setdefault("redundancy", {})
+        sd_cfg.setdefault("debug", {})
+        sd_cfg.setdefault("mask", {})
+        if opt.sd_lamma_budget_mode is not None:
+            sd_cfg["network"]["budget_mode"] = opt.sd_lamma_budget_mode
+        if opt.sd_lamma_max_comm_ratio is not None:
+            sd_cfg["network"]["max_comm_ratio"] = opt.sd_lamma_max_comm_ratio
+        if opt.sd_lamma_demand_topk_ratio is not None:
+            sd_cfg["demand"]["topk_ratio"] = opt.sd_lamma_demand_topk_ratio
+        if opt.sd_lamma_supply_threshold is not None:
+            sd_cfg["supply"]["confidence_threshold"] = opt.sd_lamma_supply_threshold
+        if opt.sd_lamma_no_redundancy:
+            sd_cfg["redundancy"]["enabled"] = False
+        if opt.sd_lamma_allow_overlap:
+            sd_cfg["redundancy"]["allow_overlap"] = True
+        sd_cfg["debug"]["log"] = opt.sd_lamma_log
+        sd_cfg["debug"]["save_masks"] = opt.sd_lamma_save_masks
 
     print('Creating Model')
     model = train_utils.create_model(hypes)

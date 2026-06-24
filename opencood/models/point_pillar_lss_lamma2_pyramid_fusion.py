@@ -15,6 +15,7 @@ from opencood.models.sub_modules.feature_alignnet import AlignNet
 from opencood.models.sub_modules.base_bev_backbone import BaseBEVBackbone
 from opencood.models.sub_modules.downsample_conv import DownsampleConv
 from opencood.models.sub_modules.naive_compress import NaiveCompressor
+from opencood.tools.sd_lamma import SupplyDemandLAMMAComm
 from opencood.models.fuse_modules.fusion_in_one import (
     MaxFusion, AttFusion, DiscoFusion, 
     V2VNetFusion, V2XViTFusion, 
@@ -195,6 +196,18 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         Note the input of PyramidFusion has downsampled 2x. (SECOND required)
         """
         self.pyramid_backbone = PyramidFusion(args['fusion_backbone'])
+
+        self.sd_lamma_enabled = False
+        self.sd_lamma_comm = None
+        sd_lamma_cfg = args.get("sd_lamma", None)
+        if sd_lamma_cfg:
+            sd_lamma_cfg = dict(sd_lamma_cfg)
+            sd_lamma_cfg.setdefault("lidar_range", self.cav_range)
+            sd_lamma_cfg.setdefault("voxel_size", self.voxel_size)
+            self.sd_lamma_enabled = bool(sd_lamma_cfg.get("enabled", False))
+            self.sd_lamma_comm = SupplyDemandLAMMAComm(sd_lamma_cfg)
+            if self.sd_lamma_enabled:
+                print("[SD-LAMMA] enabled:", sd_lamma_cfg)
         
         # freeze multi-modal fusion
         setattr(self, f"ma_fusion_freeze", args['fusion_backbone'].get('freeze', False))
@@ -394,6 +407,18 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         if self.compress:
             mm_feature_2d = self.compressor(mm_feature_2d)
 
+        sd_lamma_debug = None
+        if self.sd_lamma_enabled and self.sd_lamma_comm is not None:
+            mm_feature_2d, sd_lamma_debug = self.sd_lamma_comm(
+                mm_feature_2d,
+                record_len,
+                affine_matrix,
+                data_dict=data_dict,
+                light_sad_info=light_sad_info,
+                runtime_modality_mask=runtime_modality_mask,
+                confidence_head=getattr(self.pyramid_backbone, "single_head_0", None),
+            )
+
         """
         Feature Fusion (multiscale).
         """
@@ -427,6 +452,8 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
             output_dict["light_sad_reasons"] = light_sad_info.get("reasons", None)
             output_dict["light_sad_mode"] = light_sad_info.get("mode", "batch")
             output_dict["light_sad_state_summary"] = light_sad_info.get("state_summary", {})
+        if sd_lamma_debug is not None:
+            output_dict["sd_lamma_debug"] = sd_lamma_debug
         
         output_dict.update({'occ_single_list': 
                             occ_outputs})
