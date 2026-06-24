@@ -270,13 +270,21 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         output_dict = {'pyramid': 'collab'}
         light_sad_info = None
         light_sad_action = "LC"
+        light_sad_actions = None
+
         if self.light_sad_enabled:
             light_sad_info = self.light_sad.dispatch(data_dict, record_len=data_dict.get("record_len", None))
-            light_sad_action = light_sad_info["action"]
+            light_sad_action = light_sad_info.get("action", "LC")
+            light_sad_actions = light_sad_info.get("actions", None)
             if self.light_sad.cfg.log:
-                print(f"[Light-SAD] action={light_sad_action}, reason={light_sad_info.get('reason')}")
-        run_lidar = light_sad_action in ["L", "LC"]
-        run_camera = light_sad_action in ["C", "LC"]
+                if light_sad_actions is not None:
+                    print(f"[Light-SAD] mode={light_sad_info.get('mode')} actions={light_sad_actions} reasons={light_sad_info.get('reasons')}")
+                else:
+                    print(f"[Light-SAD] action={light_sad_action}, reason={light_sad_info.get('reason')}")
+
+        active_actions = light_sad_actions if light_sad_actions is not None else [light_sad_action]
+        run_lidar = any("L" in action for action in active_actions)
+        run_camera = any("C" in action for action in active_actions)
 
         # agent_modality_list = data_dict['agent_modality_list'] 
         agent_modality_list = ['m1', 'm2']
@@ -366,7 +374,16 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         if self.light_sad_enabled:
             B = pc_feature.shape[0]
             N = pc_feature.shape[1]
-            runtime_modality_mask = action_to_runtime_mask(light_sad_action, B, N, pc_feature.device)
+            if light_sad_actions is not None:
+                runtime_modality_mask = action_to_runtime_mask(
+                    light_sad_actions,
+                    batch_size=B,
+                    cav_num=N,
+                    device=pc_feature.device,
+                    record_len=record_len,
+                )
+            else:
+                runtime_modality_mask = action_to_runtime_mask(light_sad_action, B, N, pc_feature.device)
         # mm_feature_2d, _, _ = self.mm_fusion(pc_feature, img_fused_feature)
         mm_feature_2d, _, _ = self.mm_fusion(
             img_fused_feature,
@@ -406,9 +423,12 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         if light_sad_info is not None:
             output_dict["light_sad_action"] = light_sad_action
             output_dict["light_sad_reason"] = light_sad_info.get("reason", "")
+            output_dict["light_sad_actions"] = light_sad_actions
+            output_dict["light_sad_reasons"] = light_sad_info.get("reasons", None)
+            output_dict["light_sad_mode"] = light_sad_info.get("mode", "batch")
+            output_dict["light_sad_state_summary"] = light_sad_info.get("state_summary", {})
         
         output_dict.update({'occ_single_list': 
                             occ_outputs})
         return output_dict
-
 

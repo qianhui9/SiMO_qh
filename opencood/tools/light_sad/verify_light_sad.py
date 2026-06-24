@@ -1,33 +1,53 @@
 import torch
 
+from .history import HistoryConfidenceBuffer
 from .light_sad import LightSADDispatcher
-from .runtime_mask import action_to_runtime_mask
+from .local_reliability import build_local_reliability
+from .runtime_mask import action_to_runtime_mask, expand_actions
 
 
-def _lidar_case(num_voxels, points_per_voxel):
+def _lidar_case(num_voxels, points_per_voxel, cav_idx=0, spread=24):
     voxel_num_points = torch.full((num_voxels,), points_per_voxel, dtype=torch.int32)
+    coords = torch.zeros((num_voxels, 4), dtype=torch.int32)
+    coords[:, 0] = int(cav_idx)
+    if num_voxels > 0:
+        coords[:, 2] = torch.arange(num_voxels, dtype=torch.int32) % spread
+        coords[:, 3] = torch.div(torch.arange(num_voxels, dtype=torch.int32), max(spread, 1), rounding_mode="trunc")
     return {
         "voxel_features": torch.ones((num_voxels, 4, 4)),
-        "voxel_coords": torch.zeros((num_voxels, 4), dtype=torch.int32),
+        "voxel_coords": coords,
         "voxel_num_points": voxel_num_points,
     }
 
 
-def _camera_case(kind="normal"):
+def _merge_lidar(cases):
+    non_empty = [case for case in cases if case["voxel_coords"].shape[0] > 0]
+    if not non_empty:
+        return _lidar_case(0, 0)
+    return {
+        "voxel_features": torch.cat([case["voxel_features"] for case in non_empty], dim=0),
+        "voxel_coords": torch.cat([case["voxel_coords"] for case in non_empty], dim=0),
+        "voxel_num_points": torch.cat([case["voxel_num_points"] for case in non_empty], dim=0),
+    }
+
+
+def _camera_case(kind="normal", cav_num=1):
+    torch.manual_seed(7)
+    imgs = torch.rand((cav_num, 2, 3, 32, 32)) * 0.6 + 0.2
     if kind == "dark":
-        imgs = torch.zeros((1, 2, 3, 32, 32)) + 0.04
-    else:
-        torch.manual_seed(7)
-        imgs = torch.rand((1, 2, 3, 32, 32)) * 0.6 + 0.2
+        imgs = torch.zeros((cav_num, 2, 3, 32, 32)) + 0.04
     return {"imgs": imgs}
 
 
-def _data_dict(lidar, camera, network=None):
-    return {
+def _data_dict(lidar, camera, network=None, history=None):
+    data = {
         "processed_lidar": lidar,
         "image_inputs": camera,
         "network_state": network or {},
     }
+    if history is not None:
+        data["light_sad_history"] = history
+    return data
 
 
 def _run_case(name, dispatcher, data_dict, expected):
@@ -41,9 +61,8 @@ def _run_case(name, dispatcher, data_dict, expected):
         assert action == expected, f"{name}: expected {expected}, got {action}"
 
 
-def main():
-    dispatcher = LightSADDispatcher({"enabled": True})
-
+def _test_global_actions():
+    dispatcher = LightSADDispatcher({"enabled": True, "per_cav": False})
     _run_case(
         "good_lidar",
         dispatcher,
@@ -64,14 +83,96 @@ def main():
     )
     _run_case(
         "force_camera",
-        LightSADDispatcher({"enabled": True, "policy": "force", "force_action": "C"}),
+        LightSADDispatcher({"enabled": True, "policy": "force", "force_action": "C", "per_cav": False}),
         _data_dict(_lidar_case(900, 10), _camera_case("normal")),
         "C",
     )
 
-    mask = action_to_runtime_mask("L", batch_size=1, cav_num=3, device=torch.device("cpu"))
-    assert mask["camera"].sum().item() == 0
-    assert mask["lidar"].sum().item() == 3
+
+def _test_per_cav_actions():
+    lidar = _merge_lidar([
+        _lidar_case(900, 10, cav_idx=0),
+        _lidar_case(200, 3, cav_idx=1),
+        _lidar_case(0, 0, cav_idx=2),
+        _lidar_case(600, 8, cav_idx=3),
+    ])
+    imgs = _camera_case("normal", cav_num=4)["imgs"]
+    imgs[3] = 0.04
+    data = _data_dict(lidar, {"imgs": imgs})
+    result = LightSADDispatcher({"enabled": True, "per_cav": True}).dispatch(
+        data, record_len=torch.tensor([4])
+    )
+    print("[Light-SAD verify] per_cav actions=", result["actions"], "reasons=", result["reasons"])
+    assert result["mode"] == "per_cav"
+    assert result["actions"] == ["L", "LC", "C", "L"], result["actions"]
+
+    mask = action_to_runtime_mask(result["actions"], record_len=torch.tensor([4]), device=torch.device("cpu"))
+    assert mask["camera"].tolist() == [[0.0, 1.0, 1.0, 0.0]]
+    assert mask["lidar"].tolist() == [[1.0, 1.0, 0.0, 1.0]]
+
+
+def _test_force_actions():
+    actions = expand_actions("L,LC,C", 5)
+    assert actions == ["L", "LC", "C", "L", "LC"]
+    result = LightSADDispatcher({
+        "enabled": True,
+        "policy": "force",
+        "force_actions": "L,LC,C",
+        "per_cav": True,
+    }).dispatch(_data_dict(_lidar_case(10, 1), _camera_case("normal")), record_len=torch.tensor([5]))
+    print("[Light-SAD verify] force_actions=", result["actions"])
+    assert result["actions"] == actions
+
+
+def _test_history():
+    history = HistoryConfidenceBuffer(topk=2, stale_limit=1)
+    high = history.update(torch.tensor([0.9, 0.8, 0.7]))
+    assert high["valid"] and high["last_topk_mean_score"] > 0.8
+    high_result = LightSADDispatcher({
+        "enabled": True,
+        "per_cav": False,
+        "use_history": True,
+        "policy": "emc2_rule_history",
+    }).dispatch(_data_dict(_lidar_case(900, 10), _camera_case("normal"), history=high))
+    print("[Light-SAD verify] high_history action=", high_result["action"])
+    assert high_result["action"] == "L"
+
+    low_history = {
+        "last_mean_score": 0.1,
+        "last_topk_mean_score": 0.1,
+        "last_num_detections": 2,
+        "stale_frames": 0,
+        "valid": True,
+    }
+    low_result = LightSADDispatcher({
+        "enabled": True,
+        "per_cav": False,
+        "use_history": True,
+        "policy": "emc2_rule_history",
+    }).dispatch(_data_dict(_lidar_case(600, 8), _camera_case("normal"), history=low_history))
+    print("[Light-SAD verify] low_history action=", low_result["action"])
+    assert low_result["action"] == "LC"
+
+    history.step_without_update()
+    stale = history.step_without_update()
+    assert not stale["valid"]
+
+
+def _test_local_reliability():
+    data = _data_dict(_lidar_case(100, 2), _camera_case("normal"))
+    local = build_local_reliability(data, record_len=torch.tensor([1]), camera_stats_per_cav=[{"valid": True, "contrast": 0.2, "blur_proxy": 0.1, "dark_score": 0.0}])
+    summary = local[0]["summary"]
+    print("[Light-SAD verify] local_summary=", summary)
+    assert "low_lidar_region_ratio" in summary
+    assert local[0]["lidar_reliability_map"].shape == (16, 16)
+
+
+def main():
+    _test_global_actions()
+    _test_per_cav_actions()
+    _test_force_actions()
+    _test_history()
+    _test_local_reliability()
     print("Light-SAD verification passed.")
 
 

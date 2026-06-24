@@ -17,6 +17,10 @@ from opencood.data_utils.datasets import build_dataset
 from opencood.utils import eval_utils
 from opencood.visualization import vis_utils, simple_vis
 from opencood.utils.common_utils import update_dict
+try:
+    from opencood.tools.light_sad import HistoryConfidenceBuffer
+except Exception:
+    HistoryConfidenceBuffer = None
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 def test_parser():
@@ -43,6 +47,21 @@ def test_parser():
                         help="Force Light-SAD action for smoke test.")
     parser.add_argument("--light_sad_log", action="store_true",
                         help="Print Light-SAD action and reason.")
+    parser.add_argument("--light_sad_per_cav", action="store_true",
+                        help="Enable per-CAV Light-SAD scheduling.")
+    parser.add_argument("--light_sad_use_history", action="store_true",
+                        help="Use previous-frame detection score history for Light-SAD.")
+    parser.add_argument("--light_sad_use_local_reliability", action="store_true",
+                        help="Use coarse local reliability summaries for Light-SAD.")
+    parser.add_argument("--light_sad_policy", default="emc2_rule",
+                        choices=["force", "emc2_rule", "emc2_rule_history", "emc2_rule_local", "emc2_rule_full"],
+                        help="Light-SAD decision policy.")
+    parser.add_argument("--light_sad_force_actions", default=None,
+                        help="Comma-separated per-CAV force actions, e.g. L,LC,C. Values cycle if fewer than CAVs.")
+    parser.add_argument("--light_sad_dump_state", action="store_true",
+                        help="Dump Light-SAD state/debug summaries as JSONL.")
+    parser.add_argument("--light_sad_dump_path", default=None,
+                        help="Path for --light_sad_dump_state JSONL output.")
     parser.add_argument("--light_sad_max_batches", type=int, default=None,
                         help="Optional smoke-test limit.")
     opt = parser.parse_args()
@@ -100,10 +119,20 @@ def main():
     if opt.light_sad_enable:
         model_args = hypes["model"]["args"]
         model_args["light_sad"] = model_args.get("light_sad", {})
+        if opt.light_sad_force_action and opt.light_sad_force_actions:
+            print("[Light-SAD] both force_action and force_actions provided; per-CAV force_actions takes priority.")
+            opt.light_sad_force_action = None
         model_args["light_sad"]["enabled"] = True
-        model_args["light_sad"]["policy"] = "force" if opt.light_sad_force_action else "emc2_rule"
+        model_args["light_sad"]["policy"] = "force" if (opt.light_sad_force_action or opt.light_sad_force_actions) else opt.light_sad_policy
         model_args["light_sad"]["force_action"] = opt.light_sad_force_action
+        model_args["light_sad"]["force_actions"] = opt.light_sad_force_actions
         model_args["light_sad"]["log"] = opt.light_sad_log
+        if opt.light_sad_per_cav or opt.light_sad_force_actions:
+            model_args["light_sad"]["per_cav"] = True
+        model_args["light_sad"]["use_history"] = opt.light_sad_use_history
+        model_args["light_sad"]["use_local_reliability"] = opt.light_sad_use_local_reliability
+        model_args["light_sad"]["debug_dump_state"] = opt.light_sad_dump_state
+        model_args["light_sad"]["debug_dump_path"] = opt.light_sad_dump_path
 
     print('Creating Model')
     model = train_utils.create_model(hypes)
@@ -141,6 +170,18 @@ def main():
                 0.5: {'tp': [], 'fp': [], 'gt': 0, 'score': []},                
                 0.7: {'tp': [], 'fp': [], 'gt': 0, 'score': []}}
 
+    history_buffer = None
+    history_missing_score_warned = False
+    if opt.light_sad_enable and opt.light_sad_use_history:
+        if HistoryConfidenceBuffer is None:
+            print("[Light-SAD] HistoryConfidenceBuffer unavailable; history is disabled.")
+        else:
+            light_sad_cfg = hypes["model"]["args"].get("light_sad", {})
+            history_buffer = HistoryConfidenceBuffer(
+                topk=light_sad_cfg.get("history_topk", 20),
+                stale_limit=light_sad_cfg.get("history_stale_limit", 3),
+            )
+
     
     infer_info = opt.fusion_method + opt.note
     try:
@@ -162,6 +203,8 @@ def main():
             continue
         with torch.no_grad():
             batch_data = train_utils.to_device(batch_data, device)
+            if history_buffer is not None and 'ego' in batch_data:
+                batch_data['ego']['light_sad_history'] = history_buffer.get_state()
 
             if opt.fusion_method == 'late':
                 infer_result = inference_utils.inference_late_fusion(batch_data,
@@ -195,6 +238,11 @@ def main():
             pred_box_tensor = infer_result['pred_box_tensor']
             gt_box_tensor = infer_result['gt_box_tensor']
             pred_score = infer_result['pred_score']
+            if history_buffer is not None:
+                if pred_score is None and not history_missing_score_warned:
+                    print("[Light-SAD] pred_score unavailable; history update will be stale until scores appear.")
+                    history_missing_score_warned = True
+                history_buffer.update(pred_score)
             
             eval_utils.caluclate_tp_fp(pred_box_tensor,
                                     pred_score,

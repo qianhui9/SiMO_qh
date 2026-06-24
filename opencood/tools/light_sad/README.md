@@ -1,49 +1,37 @@
-# Light-SAD 实现说明
+# Light-SAD v1 实现说明
 
-Light-SAD（Lightweight Scenario-Adaptive Modality Dispatcher）是在 SiMO 前端新增的 EMC2-style 轻量模态调度器。它在不先运行完整 LiDAR+Camera 双分支的前提下，根据当前 batch 的低成本状态选择 `L`、`C` 或 `LC`，再让被选模态继续经过原有 aligner 和 LAMMA，保证输出仍落在统一 BEV 语义空间。
+Light-SAD v1 是 SiMO_qh 中的 per-CAV runtime modality scheduling prototype。它不是完整 EMC2，也不是完整 MoME：本版本只借鉴 EMC2 的前置轻量模态调度思想，以及 MoME 的局部可靠性建模思想，不接入 OpenPCDet、不接入 DETR query decoder/AQR/MED，也不接入真实网络 trace、真实 RTT、真实带宽或 packet delay。
 
 ## 主要实现
 
-新增代码位于 `opencood/tools/light_sad/`：
+新增和扩展代码集中在 `opencood/tools/light_sad/`：
 
-- `config.py`：定义 `LightSADConfig`，支持从 YAML/CLI 注入的 dict 初始化，并忽略未知字段。主要包含若干规则阈值，例如 LiDAR 点数阈值、体素阈值、Camera 亮度/模糊阈值、网络带宽和 RTT 阈值等
+- `config.py`：扩展 `LightSADConfig`，新增 `per_cav`、history/local reliability 开关、EMC2-style proxy 阈值、debug dump 配置和 `force_actions`。
+- `sensor_stats.py`：从真实 `processed_lidar`、`image_inputs` 中提取 batch/global 与 per-CAV 统计。LiDAR 优先按 `voxel_coords[:, 0]` 作为 flattened CAV index 分组；如果只能得到 batch-level 或无法可靠切分，则 fallback 并广播统计。
+- `light_sad.py`：实现 batch/global 与 per-CAV 兼容调度输出，支持 `force`、`emc2_rule`、`emc2_rule_history`、`emc2_rule_local`、`emc2_rule_full`。
+- `runtime_mask.py`：保留 global action mask，同时支持 flattened per-CAV actions 生成 `[B, max_cav]` 的 camera/lidar runtime mask。
+- `history.py`：新增 `HistoryConfidenceBuffer`，用上一帧检测 score 的均值、top-k 均值、检测数量和 stale 状态辅助下一帧调度。
+- `local_reliability.py`：新增 coarse BEV local reliability map，只作为调度辅助和 debug summary，不改变 Pyramid Fusion 权重。
+- `verify_light_sad.py`：扩展为不依赖数据集、权重和 GPU 的 Light-SAD v1 单元验证。
 
+主模型 hook 位于 `opencood/models/point_pillar_lss_lamma2_pyramid_fusion.py`：
 
-- `sensor_stats.py`：从 `processed_lidar`、`image_inputs` 和可选 `network_state` 中提取点数、体素数、亮度、对比度、blur proxy、带宽和 RTT 等轻量状态。sensor_stats.py 的作用是从当前 batch 的 data_dict 中提取调度所需的轻量统计量，而不是先运行完整双分支网络。
+- Light-SAD 未启用时，原始双分支路径保持不变。
+- Light-SAD 启用时，forward 开头调用 dispatcher。
+- 如果所有 CAV 都不需要 camera，则跳过 camera encoder/backbone/aligner。
+- 如果所有 CAV 都不需要 LiDAR，则跳过 LiDAR encoder/backbone/aligner。
+- mixed per-CAV 动作下，先运行双分支，再在 LAMMA 前用 per-CAV runtime mask 屏蔽不需要的模态。
+- 不修改 Pyramid Fusion、Detection Head 或后处理核心逻辑。
 
+Inference hook 位于 `opencood/tools/inference.py`：
 
-- `light_sad.py`：规则式 EMC2-style 动作决策。实现 `LightSADDispatcher`，按规则输出 batch-level 动作 `L`、`C` 或 `LC` 及原因。
-  LightSADDispatcher.dispatch() 做两件事：先调用 collect_light_sad_state(data_dict) 提取状态，再调用 decide_action(state) 输出动作和原因。
-  目前定义的自动规则大致如下：
-  1. LiDAR 无效、Camera 有效 -> C
-  2. Camera 无效、LiDAR 有效 -> L
-  3. 网络差：
-    - LiDAR 质量好 -> L
-    - LiDAR 弱且 Camera 可用 -> C
-    - 否则 -> L
-  4. Camera 太暗 -> L
-  5. Camera 模糊 -> L
-  6. LiDAR 弱但 Camera 好 -> LC
-  7. LiDAR 好 -> L
-  8. 默认 -> LC
-
-
-- `runtime_mask.py`：把动作转成 LAMMA runtime mask，形状为 `[B, N]` 的 camera/lidar mask。这一步很关键，因为它把前端调度动作转成了 LAMMA 可以识别的运行时屏蔽信号，使得 SiMO 的统一 BEV 语义空间仍然成立。
-
-
-- `verify_light_sad.py`：不依赖数据集和权重的单元验证脚本。
-
-模型侧 hook 保持默认关闭：
-
-- `opencood/models/fuse_modules/lamma.py`：`LAMMA3.forward` 新增 `runtime_modality_mask=None`。未传 mask 时，原始 `single_mode` 和 `random_drop` 行为不变；传入 mask 时，在 embedding 后对 camera/lidar 分支做运行时屏蔽。
-- `opencood/models/point_pillar_lss_lamma2_pyramid_fusion.py`：读取 `model.args.light_sad`。启用后先调度，再按 batch-level 动作跳过未选模态的 encoder/backbone/aligner；LAMMA 前用同形状零特征补齐缺失模态，并传入 runtime mask。
-- `opencood/tools/inference.py`：新增 Light-SAD CLI 参数，在创建模型前把配置注入 `hypes["model"]["args"]`。
-
-第一版只做帧级/批级调度，当前 batch 内所有 CAV 共用同一个动作，避免改动 batch 组装和 per-CAV 动态分支逻辑。
+- 新增 per-CAV、history、local reliability、policy、force_actions、debug dump CLI。
+- 如果 `--light_sad_use_history` 开启，每个 batch forward 前注入上一帧 history state；post-processing 后用 `pred_score` 更新 `HistoryConfidenceBuffer`。
+- 如果取不到 score，则优雅降级为 stale history，不中断推理。
 
 ## 运行指令
 
-先进入项目并切换环境：
+进入项目并切换环境：
 
 ```bash
 cd /data/qh/phdCode/work3/SiMO_qh
@@ -53,24 +41,19 @@ conda activate SiMO_qh
 静态语法检查：
 
 ```bash
-python -m py_compile \
-  opencood/tools/light_sad/config.py \
-  opencood/tools/light_sad/sensor_stats.py \
-  opencood/tools/light_sad/light_sad.py \
-  opencood/tools/light_sad/runtime_mask.py \
-  opencood/tools/light_sad/verify_light_sad.py \
+python -m py_compile opencood/tools/light_sad/*.py \
   opencood/models/fuse_modules/lamma.py \
   opencood/models/point_pillar_lss_lamma2_pyramid_fusion.py \
   opencood/tools/inference.py
 ```
 
-调度器单元测试：
+Light-SAD 单元验证：
 
 ```bash
 python -m opencood.tools.light_sad.verify_light_sad
 ```
 
-不启用 Light-SAD 的原始推理回归测试：
+原始推理回归测试，不启用 Light-SAD：
 
 ```bash
 python opencood/tools/inference.py \
@@ -79,7 +62,7 @@ python opencood/tools/inference.py \
   --light_sad_max_batches 2
 ```
 
-强制 LiDAR-only 路径 smoke test：
+全局强制 LiDAR-only：
 
 ```bash
 python opencood/tools/inference.py \
@@ -91,7 +74,7 @@ python opencood/tools/inference.py \
   --light_sad_max_batches 2
 ```
 
-强制 Camera-only 路径 smoke test：
+全局强制 Camera-only：
 
 ```bash
 python opencood/tools/inference.py \
@@ -103,7 +86,7 @@ python opencood/tools/inference.py \
   --light_sad_max_batches 2
 ```
 
-强制 LiDAR+Camera 路径 smoke test：
+全局强制 LC：
 
 ```bash
 python opencood/tools/inference.py \
@@ -115,13 +98,29 @@ python opencood/tools/inference.py \
   --light_sad_max_batches 2
 ```
 
-自动调度路径 smoke test：
+per-CAV mixed action smoke test：
 
 ```bash
 python opencood/tools/inference.py \
   --model_dir saved_models/SiMO-PF \
   --fusion_method intermediate \
   --light_sad_enable \
+  --light_sad_per_cav \
+  --light_sad_force_actions L,LC,C \
   --light_sad_log \
-  --light_sad_max_batches 100
+  --light_sad_max_batches 2
+```
+
+history/local reliability smoke test：
+
+```bash
+python opencood/tools/inference.py \
+  --model_dir saved_models/SiMO-PF \
+  --fusion_method intermediate \
+  --light_sad_enable \
+  --light_sad_per_cav \
+  --light_sad_use_history \
+  --light_sad_use_local_reliability \
+  --light_sad_log \
+  --light_sad_max_batches 5
 ```
