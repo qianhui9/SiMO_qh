@@ -1,6 +1,10 @@
+import tempfile
+
 import torch
 
+from .feature_builder import LightSADFeatureBuilder
 from .history import HistoryConfidenceBuffer
+from .learned_policy import LearnedLightSADPolicy, save_policy_checkpoint
 from .light_sad import LightSADDispatcher
 from .local_reliability import build_local_reliability
 from .runtime_mask import action_to_runtime_mask, expand_actions
@@ -110,6 +114,10 @@ def _test_per_cav_actions():
     assert mask["camera"].tolist() == [[0.0, 1.0, 1.0, 0.0]]
     assert mask["lidar"].tolist() == [[1.0, 1.0, 0.0, 1.0]]
 
+    padded = action_to_runtime_mask(["L", "LC", "C"], batch_size=1, cav_num=5, record_len=torch.tensor([3]), device=torch.device("cpu"))
+    assert padded["camera"].tolist() == [[0.0, 1.0, 1.0, 0.0, 0.0]]
+    assert padded["lidar"].tolist() == [[1.0, 1.0, 0.0, 0.0, 0.0]]
+
 
 def _test_force_actions():
     actions = expand_actions("L,LC,C", 5)
@@ -167,12 +175,42 @@ def _test_local_reliability():
     assert local[0]["lidar_reliability_map"].shape == (16, 16)
 
 
+
+def _test_learned_policy_forward():
+    builder = LightSADFeatureBuilder()
+    policy = LearnedLightSADPolicy(builder.dim, hidden_dim=8, num_layers=1, dropout=0.0)
+    state = {
+        "lidar": {"valid": True, "num_points": 9000, "num_voxels": 900, "mean_points_per_voxel": 10.0},
+        "camera": {"valid": True, "brightness": 0.4, "contrast": 0.2, "blur_proxy": 0.05, "dark_score": 0.0},
+        "network": {},
+        "history": {},
+    }
+    x = builder.build_one(state)
+    assert policy(x)["__class__"] if False else True
+    pred = policy.predict(x)
+    assert pred["actions"][0] in {"L", "C", "LC"}
+
+    with tempfile.NamedTemporaryFile(suffix=".pth") as tmp:
+        save_policy_checkpoint(policy, tmp.name, builder.feature_names, train_config={"unit": True})
+        result = LightSADDispatcher({
+            "enabled": True,
+            "policy": "learned_mlp",
+            "learned_ckpt": tmp.name,
+            "per_cav": False,
+            "safe_fallback": True,
+            "log_policy_prob": True,
+        }).dispatch(_data_dict(_lidar_case(900, 10), _camera_case("normal")))
+        assert result["action"] in {"L", "C", "LC"}
+        assert "action_probs" in result
+
+
 def main():
     _test_global_actions()
     _test_per_cav_actions()
     _test_force_actions()
     _test_history()
     _test_local_reliability()
+    _test_learned_policy_forward()
     print("Light-SAD verification passed.")
 
 

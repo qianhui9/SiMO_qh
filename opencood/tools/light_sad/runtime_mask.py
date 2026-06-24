@@ -14,6 +14,7 @@ def _record_len_to_list(record_len) -> List[int]:
 
 
 def _validate_action(action: str) -> str:
+    action = str(action).upper()
     if action not in {"L", "C", "LC"}:
         raise ValueError("Unsupported Light-SAD action: %s" % action)
     return action
@@ -27,10 +28,15 @@ def expand_actions(actions, total_cavs: int) -> List[str]:
     if not parts:
         parts = ["LC"]
     parts = [_validate_action(str(x)) for x in parts]
-    expanded = []
-    for idx in range(total_cavs):
-        expanded.append(parts[idx % len(parts)])
-    return expanded
+    return [parts[idx % len(parts)] for idx in range(int(total_cavs))]
+
+
+def _zero_padding(mask: torch.Tensor, lengths: List[int]):
+    if not lengths:
+        return
+    for b, length in enumerate(lengths):
+        if int(length) < mask.shape[1]:
+            mask[b, int(length):] = 0.0
 
 
 def action_to_runtime_mask(action, batch_size: Optional[int] = None, cav_num: Optional[int] = None, device=None, record_len=None) -> dict:
@@ -38,7 +44,7 @@ def action_to_runtime_mask(action, batch_size: Optional[int] = None, cav_num: Op
     Convert a global action or flattened per-CAV actions to LAMMA masks.
 
     Global action:
-      action_to_runtime_mask("L", B, N, device)
+      action_to_runtime_mask("L", B, N, device, record_len=record_len)
 
     Per-CAV action:
       action_to_runtime_mask(["L", "LC", "C"], record_len=record_len, device=device)
@@ -51,7 +57,7 @@ def action_to_runtime_mask(action, batch_size: Optional[int] = None, cav_num: Op
         actions = expand_actions(action, total)
         if lengths:
             batch_size = len(lengths)
-            cav_num = max(lengths) if lengths else total
+            cav_num = int(cav_num or (max(lengths) if lengths else total))
         else:
             batch_size = int(batch_size or 1)
             cav_num = int(cav_num or max(total, 1))
@@ -60,18 +66,26 @@ def action_to_runtime_mask(action, batch_size: Optional[int] = None, cav_num: Op
         lidar = torch.zeros((batch_size, cav_num), device=device)
         flat_idx = 0
         for b, length in enumerate(lengths):
-            for n in range(min(length, cav_num)):
-                act = actions[flat_idx]
+            for n in range(min(int(length), cav_num)):
+                act = _validate_action(actions[flat_idx])
                 cam[b, n] = 1.0 if "C" in act else 0.0
                 lidar[b, n] = 1.0 if "L" in act else 0.0
                 flat_idx += 1
         return {"camera": cam, "lidar": lidar}
 
     action = _validate_action(action)
+    if lengths and batch_size is None:
+        batch_size = len(lengths)
+    if lengths and cav_num is None:
+        cav_num = max(lengths)
+    batch_size = int(batch_size or 1)
+    cav_num = int(cav_num or 1)
     cam = torch.ones((batch_size, cav_num), device=device)
     lidar = torch.ones((batch_size, cav_num), device=device)
     if action == "L":
         cam.zero_()
     elif action == "C":
         lidar.zero_()
+    _zero_padding(cam, lengths)
+    _zero_padding(lidar, lengths)
     return {"camera": cam, "lidar": lidar}

@@ -25,6 +25,7 @@ from opencood.tools import train_utils
 from opencood.utils.transformation_utils import normalize_pairwise_tfm
 from opencood.utils.model_utils import check_trainable_module, fix_bn, unfix_bn
 import importlib
+import time
 import torchvision
 
 from efficientnet_pytorch import EfficientNet
@@ -319,19 +320,35 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
 
     def forward(self, data_dict):
         output_dict = {'pyramid': 'collab'}
+        runtime_profile = {
+            "light_sad_enabled": bool(self.light_sad_enabled),
+            "policy_inference_time_ms": 0.0,
+            "encoder_time_ms": 0.0,
+            "lamma_time_ms": 0.0,
+            "sd_lamma_time_ms": 0.0,
+            "pyramid_fusion_time_ms": 0.0,
+        }
         light_sad_info = None
         light_sad_action = "LC"
         light_sad_actions = None
 
         if self.light_sad_enabled:
+            policy_start = time.perf_counter()
             light_sad_info = self.light_sad.dispatch(data_dict, record_len=data_dict.get("record_len", None))
+            runtime_profile["policy_total_time_ms"] = (time.perf_counter() - policy_start) * 1000.0
+            policy_time = light_sad_info.get("policy_inference_time_ms", 0.0)
+            if isinstance(policy_time, list):
+                policy_time = sum(float(x or 0.0) for x in policy_time)
+            runtime_profile["policy_inference_time_ms"] = float(policy_time or 0.0)
             light_sad_action = light_sad_info.get("action", "LC")
             light_sad_actions = light_sad_info.get("actions", None)
             if self.light_sad.cfg.log:
                 if light_sad_actions is not None:
-                    print(f"[Light-SAD] mode={light_sad_info.get('mode')} actions={light_sad_actions} reasons={light_sad_info.get('reasons')}")
+                    print(f"[Light-SAD] mode={light_sad_info.get('mode')} policy={light_sad_info.get('policy_type')} actions={light_sad_actions} reasons={light_sad_info.get('reasons')}")
                 else:
-                    print(f"[Light-SAD] action={light_sad_action}, reason={light_sad_info.get('reason')}")
+                    print(f"[Light-SAD] policy={light_sad_info.get('policy_type')} action={light_sad_action}, reason={light_sad_info.get('reason')}")
+                if self.light_sad.cfg.log_policy_prob and light_sad_info.get("action_probs") is not None:
+                    print(f"[Light-SAD] action_probs={light_sad_info.get('action_probs')} fallback={light_sad_info.get('fallback_used')}")
 
         record_len = data_dict['record_len']
         active_actions = light_sad_actions if light_sad_actions is not None else [light_sad_action]
@@ -342,6 +359,9 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         )
         run_lidar = any("L" in str(action) for action in active_actions)
         run_camera = any("C" in str(action) for action in active_actions)
+        runtime_profile["run_lidar_branch"] = bool(run_lidar)
+        runtime_profile["run_camera_branch"] = bool(run_camera)
+        runtime_profile["selected_action"] = light_sad_actions if light_sad_actions is not None else light_sad_action
 
         available_modality_dict = {name: 1 for name in self.modality_name_list}
         affine_matrix = normalize_pairwise_tfm(data_dict['pairwise_t_matrix'], self.H, self.W, self.fake_voxel_size)
@@ -368,6 +388,7 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
             if modality_name == "m2" and not run_camera:
                 continue
 
+            modality_start = time.perf_counter()
             if eval(f"self.encoder_{modality_name}_freeze"):
                 eval(f"self.encoder_{modality_name}").eval()
             feature = eval(f"self.encoder_{modality_name}")(data_dict, modality_name)                               # m1: torch.Size([4, 64, 256, 256])  m2: torch.Size([4, 128, 256, 256])
@@ -385,6 +406,9 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
             feature = eval(f"self.aligner_{modality_name}")(feature)                                                # m1: torch.Size([3, 64, 128, 128]) m2: torch.Size([3, 64, 128, 128])
             
             modality_feature_dict[modality_name] = feature
+            elapsed = (time.perf_counter() - modality_start) * 1000.0
+            runtime_profile[f"{modality_name}_encoder_time_ms"] = elapsed
+            runtime_profile["encoder_time_ms"] += elapsed
 
         """
         Crop/Padd camera feature map.
@@ -437,19 +461,22 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
                     record_len=record_len,
                 )
             else:
-                runtime_modality_mask = action_to_runtime_mask(light_sad_action, B, N, pc_feature.device)
+                runtime_modality_mask = action_to_runtime_mask(light_sad_action, B, N, pc_feature.device, record_len=record_len)
         # mm_feature_2d, _, _ = self.mm_fusion(pc_feature, img_fused_feature)
+        lamma_start = time.perf_counter()
         mm_feature_2d, _, _ = self.mm_fusion(
             img_fused_feature,
             pc_feature,
             runtime_modality_mask=runtime_modality_mask
         ) # torch.Size([3, 64, 64, 64])
+        runtime_profile["lamma_time_ms"] = (time.perf_counter() - lamma_start) * 1000.0
 
         if self.compress:
             mm_feature_2d = self.compressor(mm_feature_2d)
 
         sd_lamma_debug = None
         if self.sd_lamma_enabled and self.sd_lamma_comm is not None:
+            sd_start = time.perf_counter()
             mm_feature_2d, sd_lamma_debug = self.sd_lamma_comm(
                 mm_feature_2d,
                 record_len,
@@ -459,6 +486,7 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
                 runtime_modality_mask=runtime_modality_mask,
                 confidence_head=getattr(self.pyramid_backbone, "single_head_0", None),
             )
+            runtime_profile["sd_lamma_time_ms"] = (time.perf_counter() - sd_start) * 1000.0
 
         """
         Feature Fusion (multiscale).
@@ -467,6 +495,7 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         # add croping information to collaboration module
         if self.ma_fusion_freeze:
             self.pyramid_backbone.eval()
+        pyramid_start = time.perf_counter()
         fused_feature, occ_outputs = self.pyramid_backbone.forward_collab(
                                                 mm_feature_2d,
                                                 record_len,
@@ -474,6 +503,7 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
                                                 agent_modality_list,
                                                 self.cam_crop_info
                                             ) # torch.Size([1, 256, 64, 64])
+        runtime_profile["pyramid_fusion_time_ms"] = (time.perf_counter() - pyramid_start) * 1000.0
 
         if self.shrink_flag:
             fused_feature = self.shrink_conv(fused_feature)
@@ -496,8 +526,16 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
             output_dict["light_sad_state_summary"] = light_sad_info.get("state_summary", {})
             output_dict["light_sad_reliability"] = light_sad_info.get("reliability", None)
             output_dict["light_sad_reliabilities"] = light_sad_info.get("reliabilities", None)
+            output_dict["light_sad_policy_type"] = light_sad_info.get("policy_type", None)
+            output_dict["light_sad_action_probs"] = light_sad_info.get("action_probs", None)
+            output_dict["light_sad_action_logits"] = light_sad_info.get("action_logits", None)
+            output_dict["light_sad_feature_names"] = light_sad_info.get("feature_names", None)
+            output_dict["light_sad_feature_vector"] = light_sad_info.get("feature_vector", None)
+            output_dict["light_sad_fallback_used"] = light_sad_info.get("fallback_used", None)
+            output_dict["light_sad_fallback_reason"] = light_sad_info.get("fallback_reason", light_sad_info.get("fallback_reasons", None))
         if sd_lamma_debug is not None:
             output_dict["sd_lamma_debug"] = sd_lamma_debug
+        output_dict["runtime_profile"] = runtime_profile
         
         output_dict.update({'occ_single_list': 
                             occ_outputs})

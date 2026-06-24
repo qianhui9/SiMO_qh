@@ -1,0 +1,13 @@
+{
+  "output_path": "saved_models/light_sad_policy/oracle_val_per_cav.jsonl",
+  "action_distribution": {
+    "L": 0,
+    "C": 400,
+    "LC": 0
+  },
+  "actions": [
+    "L",
+    "C",
+    "LC"
+  ]
+}

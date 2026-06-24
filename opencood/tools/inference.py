@@ -54,8 +54,24 @@ def test_parser():
     parser.add_argument("--light_sad_use_local_reliability", action="store_true",  # 启用局部可靠性代理，根据 LiDAR voxel 分布和 Camera 质量构造粗粒度 BEV reliability map
                         help="Use coarse local reliability summaries for Light-SAD.")
     parser.add_argument("--light_sad_policy", default="emc2_rule",
-                        choices=["force", "emc2_rule", "emc2_rule_history", "emc2_rule_local", "emc2_rule_full"],
+                        choices=["force", "emc2_rule", "emc2_rule_history", "emc2_rule_local", "emc2_rule_full", "learned_mlp", "hybrid"],
                         help="Light-SAD decision policy.")
+    parser.add_argument("--light_sad_learned_ckpt", default=None,
+                        help="Path to learned Light-SAD policy checkpoint.")
+    parser.add_argument("--light_sad_feature_norm_path", default=None,
+                        help="Optional feature normalization JSON for learned policy.")
+    parser.add_argument("--light_sad_temperature", type=float, default=None,
+                        help="Softmax temperature for learned policy inference.")
+    parser.add_argument("--light_sad_safe_fallback", action="store_true", default=None,
+                        help="Enable learned policy safety fallback.")
+    parser.add_argument("--light_sad_disable_safe_fallback", action="store_false", dest="light_sad_safe_fallback",
+                        help="Disable learned policy safety fallback and raise on missing/invalid checkpoint.")
+    parser.add_argument("--light_sad_min_conf_margin", type=float, default=None,
+                        help="Minimum top-1/top-2 probability margin used by hybrid fallback.")
+    parser.add_argument("--light_sad_log_policy_prob", action="store_true",
+                        help="Print learned Light-SAD action probabilities.")
+    parser.add_argument("--light_sad_log_feature_vector", action="store_true",
+                        help="Attach raw learned-policy feature vectors to debug dumps.")
     parser.add_argument("--light_sad_force_actions", default=None,
                         help="Comma-separated per-CAV force actions, e.g. L,LC,C. Values cycle if fewer than CAVs.")
     parser.add_argument("--light_sad_dump_state", action="store_true",
@@ -146,6 +162,16 @@ def main():
         model_args["light_sad"]["force_action"] = opt.light_sad_force_action
         model_args["light_sad"]["force_actions"] = opt.light_sad_force_actions
         model_args["light_sad"]["log"] = opt.light_sad_log
+        model_args["light_sad"]["learned_ckpt"] = opt.light_sad_learned_ckpt
+        model_args["light_sad"]["feature_norm_path"] = opt.light_sad_feature_norm_path
+        if opt.light_sad_temperature is not None:
+            model_args["light_sad"]["temperature"] = opt.light_sad_temperature
+        if opt.light_sad_safe_fallback is not None:
+            model_args["light_sad"]["safe_fallback"] = opt.light_sad_safe_fallback
+        if opt.light_sad_min_conf_margin is not None:
+            model_args["light_sad"]["min_conf_margin"] = opt.light_sad_min_conf_margin
+        model_args["light_sad"]["log_policy_prob"] = opt.light_sad_log_policy_prob
+        model_args["light_sad"]["log_feature_vector"] = opt.light_sad_log_feature_vector
         if opt.light_sad_per_cav or opt.light_sad_force_actions:
             model_args["light_sad"]["per_cav"] = True
         model_args["light_sad"]["use_history"] = opt.light_sad_use_history

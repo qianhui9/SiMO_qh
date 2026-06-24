@@ -189,6 +189,22 @@ model:
       random_drop: false # should be false in inference
       lidar_drop_ratio: 0.5 # useless when not singel_mode
 
+    light_sad:
+      enabled: false
+      per_cav: true
+      policy: emc2_rule
+      learned_ckpt: null
+      feature_norm_path: null
+      action_set: ["L", "C", "LC"]
+      temperature: 1.0
+      safe_fallback: true
+      min_conf_margin: 0.05
+      fallback_policy: emc2_rule
+      oracle_mode: false
+      log: true
+      log_policy_prob: false
+      log_feature_vector: false
+
     sd_lamma:
       enabled: false
       demand:
