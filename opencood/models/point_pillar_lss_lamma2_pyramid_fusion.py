@@ -279,6 +279,44 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         # TypeError: split_with_sizes(): argument 'split_sizes' (position 2) must be tuple of ints, not Tensor
         return split_x
 
+    @staticmethod
+    def _record_len_total(record_len):
+        if torch.is_tensor(record_len):
+            return int(record_len.detach().cpu().view(-1).sum().item())
+        if isinstance(record_len, (list, tuple)):
+            return int(sum(int(x) for x in record_len))
+        return int(record_len)
+
+    @staticmethod
+    def _expand_actions_for_cavs(actions, total_cavs):
+        if isinstance(actions, str):
+            parts = [x.strip() for x in actions.split(',') if x.strip()]
+        else:
+            parts = [str(x) for x in (actions or [])]
+        if not parts:
+            parts = ["LC"]
+        return [parts[idx % len(parts)] for idx in range(total_cavs)]
+
+    def _build_runtime_agent_modality_list(self, data_dict, record_len, active_actions=None):
+        total_cavs = self._record_len_total(record_len)
+        if active_actions is not None:
+            actions = self._expand_actions_for_cavs(active_actions, total_cavs)
+            modality_list = []
+            for action in actions:
+                action = str(action).upper()
+                if action == "C":
+                    modality_list.append("m2")
+                elif action == "L":
+                    modality_list.append("m1")
+                else:
+                    modality_list.append("m1_m2")
+            return modality_list
+
+        existing = data_dict.get('agent_modality_list', None)
+        if isinstance(existing, list) and len(existing) == total_cavs:
+            return existing
+        return ["m1_m2" for _ in range(total_cavs)]
+
     def forward(self, data_dict):
         output_dict = {'pyramid': 'collab'}
         light_sad_info = None
@@ -295,14 +333,18 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
                 else:
                     print(f"[Light-SAD] action={light_sad_action}, reason={light_sad_info.get('reason')}")
 
+        record_len = data_dict['record_len']
         active_actions = light_sad_actions if light_sad_actions is not None else [light_sad_action]
-        run_lidar = any("L" in action for action in active_actions)
-        run_camera = any("C" in action for action in active_actions)
+        agent_modality_list = self._build_runtime_agent_modality_list(
+            data_dict,
+            record_len,
+            active_actions if self.light_sad_enabled else None,
+        )
+        run_lidar = any("L" in str(action) for action in active_actions)
+        run_camera = any("C" in str(action) for action in active_actions)
 
-        # agent_modality_list = data_dict['agent_modality_list'] 
-        agent_modality_list = ['m1', 'm2']
+        available_modality_dict = {name: 1 for name in self.modality_name_list}
         affine_matrix = normalize_pairwise_tfm(data_dict['pairwise_t_matrix'], self.H, self.W, self.fake_voxel_size)
-        record_len = data_dict['record_len'] 
         # print("record_len:", record_len)
         # print(agent_modality_list)
 
@@ -316,11 +358,10 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
             else:
                 raise ValueError(f"Modality name {modality_name} not supported.")
 
-        modality_count_dict = Counter(agent_modality_list)
         modality_feature_dict = {}
 
-        for modality_name in self.modality_name_list:   
-            if modality_name not in modality_count_dict:
+        for modality_name in self.modality_name_list:
+            if modality_name not in available_modality_dict:
                 continue
             if modality_name == "m1" and not run_lidar:
                 continue
@@ -349,7 +390,7 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         Crop/Padd camera feature map.
         """
         for modality_name in self.modality_name_list:
-            if modality_name in modality_count_dict and modality_name in modality_feature_dict:
+            if modality_name in available_modality_dict and modality_name in modality_feature_dict:
                 if self.sensor_type_dict[modality_name] == "camera":
                     # should be padding. Instead of masking
                     feature = modality_feature_dict[modality_name]
@@ -428,9 +469,10 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
             self.pyramid_backbone.eval()
         fused_feature, occ_outputs = self.pyramid_backbone.forward_collab(
                                                 mm_feature_2d,
-                                                record_len, 
-                                                affine_matrix, 
-                                                agent_modality_list
+                                                record_len,
+                                                affine_matrix,
+                                                agent_modality_list,
+                                                self.cam_crop_info
                                             ) # torch.Size([1, 256, 64, 64])
 
         if self.shrink_flag:
@@ -452,6 +494,8 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
             output_dict["light_sad_reasons"] = light_sad_info.get("reasons", None)
             output_dict["light_sad_mode"] = light_sad_info.get("mode", "batch")
             output_dict["light_sad_state_summary"] = light_sad_info.get("state_summary", {})
+            output_dict["light_sad_reliability"] = light_sad_info.get("reliability", None)
+            output_dict["light_sad_reliabilities"] = light_sad_info.get("reliabilities", None)
         if sd_lamma_debug is not None:
             output_dict["sd_lamma_debug"] = sd_lamma_debug
         

@@ -73,6 +73,9 @@ class SupplyDemandLAMMAComm(nn.Module):
 
         self.align_corners = bool(self.mask_cfg.get("align_corners", False))
         self.debug_counter = 0
+        self._active_network_state = {}
+        self._active_channels = 1
+        self._active_dtype_bits = 32
 
     def forward(
         self,
@@ -99,6 +102,10 @@ class SupplyDemandLAMMAComm(nn.Module):
                 "SD-LAMMA record_len sum %d does not match features %d."
                 % (total_cavs, features.shape[0])
             )
+
+        self._active_network_state = self._extract_network_state(data_dict, light_sad_info)
+        self._active_channels = int(features.shape[1])
+        self._active_dtype_bits = self._dtype_bits(features.dtype)
 
         confidence = self._build_confidence(features, confidence_head)
         reliability = self._extract_reliability(
@@ -168,9 +175,8 @@ class SupplyDemandLAMMAComm(nn.Module):
             if bool(self.mask_cfg.get("multiscale", True)):
                 debug["multiscale_communication_mask"] = self._make_multiscale_masks(comm_mask)
 
-        debug["sparse_indices"] = None
-        debug["sparse_values"] = None
-        debug["dense_reconstructed_feature"] = None
+        if bool(self.mask_cfg.get("export_sparse", False)):
+            debug.update(self._dense_to_sparse_debug(masked_features, comm_mask))
         self._maybe_log(debug)
         return masked_features, debug
 
@@ -221,14 +227,15 @@ class SupplyDemandLAMMAComm(nn.Module):
     ) -> torch.Tensor:
         score = torch.zeros_like(confidence)
         weight = torch.zeros((features.shape[0], 1, 1, 1), device=features.device, dtype=features.dtype)
+        uncertainty = 1.0 - confidence
+        density_demand_for_occ = None
 
         if bool(self.demand_cfg.get("use_uncertainty", True)):
-            uncertainty = 1.0 - confidence
             w = float(self.demand_cfg.get("uncertainty_weight", 0.55))
             score = score + uncertainty * w
             weight = weight + w
 
-        if bool(self.demand_cfg.get("use_lidar_density", True)):
+        if bool(self.demand_cfg.get("use_lidar_density", True)) or bool(self.demand_cfg.get("use_occlusion", False)):
             density = self._build_lidar_density_maps(data_dict, record_len, features)
             if density is not None:
                 density_threshold = float(self.demand_cfg.get("density_threshold", 0.125))
@@ -237,9 +244,23 @@ class SupplyDemandLAMMAComm(nn.Module):
                 else:
                     density_demand = 1.0 - density
                 active = lidar_active.to(device=features.device, dtype=features.dtype).view(-1, 1, 1, 1)
-                w = float(self.demand_cfg.get("density_weight", 0.35))
-                score = score + density_demand * active * w
-                weight = weight + active * w
+                density_demand_for_occ = density_demand * active
+                if bool(self.demand_cfg.get("use_lidar_density", True)):
+                    w = float(self.demand_cfg.get("density_weight", 0.35))
+                    score = score + density_demand_for_occ * w
+                    weight = weight + active * w
+
+        if bool(self.demand_cfg.get("use_occlusion", False)):
+            # First-stage occlusion proxy: regions that are simultaneously sparse
+            # in ego LiDAR and uncertain in the single-agent BEV head. Camera-only
+            # agents fall back to uncertainty so demand never collapses to zero.
+            if density_demand_for_occ is None:
+                occlusion = uncertainty
+            else:
+                occlusion = torch.sqrt(torch.clamp(density_demand_for_occ * uncertainty, 0.0, 1.0))
+            w = float(self.demand_cfg.get("occlusion_weight", 0.15))
+            score = score + occlusion * w
+            weight = weight + w
 
         if bool(self.demand_cfg.get("use_history", False)):
             history = self._history_demand(light_sad_info, features.shape[0], features.device, features.dtype)
@@ -431,49 +452,119 @@ class SupplyDemandLAMMAComm(nn.Module):
         return self._apply_global_budget(score, mask)
 
     def _select_redundancy_aware(self, score: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        cav_num = score.shape[0]
+        cav_num, _, height, width = score.shape
         selected = torch.zeros_like(mask, dtype=torch.bool)
         if cav_num <= 1:
             return selected
 
+        collab_mask = mask[1:] & (score[1:] > 0.0)
+        if not collab_mask.any():
+            return selected
+
+        candidate_space = max((cav_num - 1) * height * width, 1)
+        budget = self._message_budget(candidate_space)
+        if budget is not None and budget <= 0:
+            return selected
+
         allow_overlap = bool(self.redundancy_cfg.get("allow_overlap", False))
-        if allow_overlap:
-            return self._apply_global_budget(score, mask)
+        demand_decay = max(0.0, min(1.0, float(self.redundancy_cfg.get("demand_decay", 1.0))))
+        flat_score = score[1:].reshape(-1)
+        flat_mask = collab_mask.reshape(-1)
+        candidate_idx = torch.nonzero(flat_mask, as_tuple=False).view(-1)
+        if candidate_idx.numel() == 0:
+            return selected
 
-        collab_score = score[1:].masked_fill(~mask[1:], -1.0)
-        best_score, best_idx = torch.max(collab_score, dim=0)
-        valid = best_score > 0.0
-        valid = self._apply_cell_budget(best_score, valid)
+        order = torch.argsort(flat_score[candidate_idx], descending=True)
+        ordered_idx = candidate_idx[order]
+        remaining = torch.ones((height * width,), device=score.device, dtype=score.dtype)
+        selected_flat = selected[1:].reshape(-1)
+        cells_per_cav = height * width
+        selected_count = 0
 
-        if valid.any():
-            selected_collab = torch.zeros_like(collab_score, dtype=torch.bool)
-            selected_collab.scatter_(0, best_idx.unsqueeze(0), True)
-            selected_collab = selected_collab & valid.unsqueeze(0)
-            selected[1:] = selected_collab
+        for idx_tensor in ordered_idx:
+            flat_idx = int(idx_tensor.item())
+            cell_idx = flat_idx % cells_per_cav
+            if remaining[cell_idx] <= 1e-6:
+                continue
+            gain = flat_score[flat_idx] * remaining[cell_idx]
+            if gain <= 0:
+                continue
+            selected_flat[flat_idx] = True
+            selected_count += 1
+
+            if allow_overlap:
+                remaining[cell_idx] = torch.clamp(remaining[cell_idx] - demand_decay, min=0.0)
+            else:
+                remaining[cell_idx] = 0.0
+
+            if budget is not None and selected_count >= budget:
+                break
+
         return selected
 
     def _apply_global_budget(self, score: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         selected = mask & (score > 0.0)
-        max_ratio = self.network_cfg.get("max_comm_ratio", None)
-        budget_mode = str(self.network_cfg.get("budget_mode", "threshold"))
-        if max_ratio is None and budget_mode != "topk":
-            return selected
-
-        ratio = 1.0 if max_ratio is None else max(0.0, min(1.0, float(max_ratio)))
         collab_cells = max((score.shape[0] - 1) * score.shape[-2] * score.shape[-1], 1)
-        budget = int(torch.ceil(torch.tensor(float(collab_cells) * ratio)).item())
+        budget = self._message_budget(collab_cells)
+        if budget is None:
+            return selected
         return self._topk_mask(score, selected, budget)
 
-    def _apply_cell_budget(self, score_2d: torch.Tensor, valid_2d: torch.Tensor) -> torch.Tensor:
+    def _message_budget(self, candidate_cells: int) -> Optional[int]:
+        ratio = self._effective_budget_ratio(candidate_cells)
+        if ratio is None:
+            return None
+        return int(torch.ceil(torch.tensor(float(candidate_cells) * ratio)).item())
+
+    def _effective_budget_ratio(self, candidate_cells: int) -> Optional[float]:
+        ratios = []
         max_ratio = self.network_cfg.get("max_comm_ratio", None)
         budget_mode = str(self.network_cfg.get("budget_mode", "threshold"))
-        if max_ratio is None and budget_mode != "topk":
-            return valid_2d
+        if max_ratio is not None:
+            ratios.append(max(0.0, min(1.0, float(max_ratio))))
+        elif budget_mode == "topk":
+            ratios.append(1.0)
 
-        ratio = 1.0 if max_ratio is None else max(0.0, min(1.0, float(max_ratio)))
-        total_cells = max(int(valid_2d.numel()), 1)
-        budget = int(torch.ceil(torch.tensor(float(total_cells) * ratio)).item())
-        return self._topk_mask(score_2d, valid_2d, budget)
+        bandwidth_mbps = self._network_value("bandwidth_mbps")
+        if bandwidth_mbps is not None:
+            frame_rate_hz = max(float(self.network_cfg.get("frame_rate_hz", 10.0)), 1.0e-6)
+            frame_budget_s = 1.0 / frame_rate_hz
+            deadline_ms = self._network_value("deadline_ms")
+            if deadline_ms is not None and deadline_ms > 0:
+                frame_budget_s = min(frame_budget_s, float(deadline_ms) / 1000.0)
+            latency_ms = self._network_value("latency_ms")
+            if latency_ms is None:
+                latency_ms = self._network_value("rtt_ms", default=0.0)
+            tx_time_s = max(0.0, frame_budget_s - float(latency_ms or 0.0) / 1000.0)
+            packet_loss = max(0.0, min(1.0, float(self._network_value("packet_loss", default=0.0) or 0.0)))
+            payload_bits = max(float(bandwidth_mbps), 0.0) * 1.0e6 * tx_time_s * (1.0 - packet_loss)
+            dense_bits = max(float(candidate_cells * self._active_channels * self._active_dtype_bits), 1.0)
+            ratios.append(max(0.0, min(1.0, payload_bits / dense_bits)))
+
+        if not ratios:
+            return None
+        return min(ratios)
+
+    def _extract_network_state(
+        self,
+        data_dict: Optional[Dict[str, Any]],
+        light_sad_info: Optional[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        state: Dict[str, float] = {}
+        if isinstance(light_sad_info, dict):
+            sad_state = light_sad_info.get("state", {})
+            if isinstance(sad_state, dict) and isinstance(sad_state.get("network", None), dict):
+                state.update(sad_state["network"])
+        if isinstance(data_dict, dict) and isinstance(data_dict.get("network_state", None), dict):
+            state.update(data_dict["network_state"])
+        return state
+
+    def _network_value(self, key: str, default=None):
+        if key in self.network_cfg and self.network_cfg.get(key) is not None:
+            return self.network_cfg.get(key)
+        if key in self._active_network_state and self._active_network_state.get(key) is not None:
+            return self._active_network_state.get(key)
+        return default
 
     @staticmethod
     def _topk_mask(score: torch.Tensor, mask: torch.Tensor, budget: int) -> torch.Tensor:
@@ -644,6 +735,21 @@ class SupplyDemandLAMMAComm(nn.Module):
             current = F.max_pool2d(current, kernel_size=2, stride=2)
             masks.append(current.cpu())
         return masks
+
+    def _dense_to_sparse_debug(self, features: torch.Tensor, comm_mask: torch.Tensor) -> Dict[str, Any]:
+        selected = comm_mask[:, 0] > 0
+        indices = torch.nonzero(selected, as_tuple=False)
+        values = features.permute(0, 2, 3, 1)[selected]
+        output = {
+            "sparse_indices": indices.detach().cpu(),
+            "sparse_values": values.detach().cpu(),
+            "sparse_shape": list(features.shape),
+        }
+        if bool(self.mask_cfg.get("return_dense_reconstructed_feature", False)):
+            reconstructed = torch.zeros_like(features)
+            reconstructed.permute(0, 2, 3, 1)[selected] = values
+            output["dense_reconstructed_feature"] = reconstructed.detach().cpu()
+        return output
 
     def _summarize(
         self,

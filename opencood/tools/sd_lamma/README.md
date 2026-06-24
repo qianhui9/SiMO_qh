@@ -32,7 +32,8 @@ Demand 是 soft score + binary mask：
 
 - LiDAR density demand：从 `processed_lidar` 或 `inputs_m1` 的 `voxel_coords` / `voxel_num_points` 生成 BEV density map，低密度区域形成更高 demand。Camera-only 时会根据 Light-SAD runtime mask 跳过该项，不会把 demand 置零。
 - Detection uncertainty demand：默认使用 Pyramid Fusion `single_head_0` 产生的 pre-fusion confidence；若 head 不可用，则回退到 LAMMA BEV feature energy。uncertainty 使用 `1 - confidence`。
-- History demand：预留并支持读取 Light-SAD history state，默认关闭。
+- History demand：支持读取 Light-SAD history state，默认关闭。
+- Occlusion demand：`use_occlusion=true` 时使用低 LiDAR density 与高 uncertainty 的联合 proxy；Camera-only 或无 density 时回退到 uncertainty，不再是空开关。
 
 ### Supply S_j
 
@@ -50,7 +51,7 @@ score_{j->i} = D_i * S_j * R_j
 
 ### Redundancy-aware Filling
 
-`redundancy.enabled=true` 时，模块借鉴 CodeFilling 的 remaining-demand 去冗余思想：在 ego 坐标系中，对同一 BEV cell 只保留 gain 最高的 collaborator，低预算时通过 `network.max_comm_ratio` 继续 top-k 裁剪。这里不实现 codebook、vector quantization 或真实 sparse serialization。
+`redundancy.enabled=true` 时，模块借鉴 CodeFilling 的 remaining-demand 去冗余思想：在 ego 坐标系中按 gain 贪心选择候选区域，并用 `demand_decay` 衰减已满足区域的 remaining demand。`allow_overlap=false` 时同一 BEV cell 只保留收益最高的 collaborator；低预算时通过 `network.max_comm_ratio` 或 `bandwidth_mbps/latency_ms/packet_loss/deadline_ms` 推导的预算继续裁剪。这里不引入 codebook 或 vector quantization。
 
 ### Debug 输出
 
@@ -63,7 +64,17 @@ score_{j->i} = D_i * S_j * R_j
 - estimated payload kbits
 - per-modality selected ratio
 
-`sd_lamma_debug` 会附加在模型 output dict 中；默认不保存 mask 张量，`debug.save_masks=true` 时才附加 demand/supply/communication mask 和 maxpool 版本的 multiscale mask。
+`sd_lamma_debug` 会附加在模型 output dict 中；默认不保存 mask 张量，`debug.save_masks=true` 时才附加 demand/supply/communication mask 和 maxpool 版本的 multiscale mask。`mask.export_sparse=true` 时会从 dense masked feature 生成真实 `sparse_indices` 与 `sparse_values`，用于检查未来 sparse serialization 的等价性。
+
+## 完整性审计
+
+当前两个模块的实际应用路径如下：
+
+- Light-SAD 从 `processed_lidar`、`image_inputs`、history 和可选 network state 中提取真实 per-CAV 状态，并输出 action 与 reliability。
+- LAMMA 在 cross-attention 前使用 `runtime_modality_mask` 对 camera/lidar embedding 逐 CAV 屏蔽。
+- 主模型按 runtime action 生成 per-CAV `agent_modality_list`，不再使用固定 `['m1', 'm2']`；Camera-only CAV 会传入 PyramidFusion 的 camera crop mask。
+- SD-LAMMA 消费 LAMMA 后统一 BEV feature、Light-SAD reliability、ego demand 和 collaborator supply，生成 receiver-conditioned dense zero mask。
+- 网络状态仍属于模拟/估算层，但 `bandwidth_mbps`、`latency_ms`、`deadline_ms`、`packet_loss` 会真实影响 top-k budget。
 
 ## 配置
 
@@ -87,6 +98,7 @@ conda activate SiMO_qh
 python -m py_compile \
   opencood/tools/sd_lamma/comm.py \
   opencood/models/point_pillar_lss_lamma2_pyramid_fusion.py \
+  opencood/models/fuse_modules/pyramid_fuse.py \
   opencood/tools/inference.py
 ```
 
@@ -133,11 +145,11 @@ python opencood/tools/inference.py \
   --fusion_method intermediate \
   --light_sad_enable \
   --light_sad_per_cav \
-  --light_sad_force_actions L,LC,C \
+  # --light_sad_force_actions L,LC,C \
   --light_sad_log \
   --sd_lamma_enable \
   --sd_lamma_log \
   --sd_lamma_budget_mode topk \
   --sd_lamma_max_comm_ratio 0.3 \
-  --light_sad_max_batches 2
+  --light_sad_max_batches 10
 ```

@@ -124,13 +124,18 @@ class PyramidFusion(ResNetBEVBackbone):
             }
         """
         crop_mask_flag = False
-        if cam_crop_info is not None and len(cam_crop_info) > 0:
-            crop_mask_flag = True
+        cam_modality_set = set()
+        cam_agent_mask_dict = {}
+        if (cam_crop_info is not None and len(cam_crop_info) > 0 and
+                agent_modality_list is not None and
+                len(agent_modality_list) == spatial_features.shape[0]):
             cam_modality_set = set(cam_crop_info.keys())
-            cam_agent_mask_dict = {}
+            crop_mask_flag = True
             for cam_modality in cam_modality_set:
-                mask_list = [1 if x == cam_modality else 0 for x in agent_modality_list] 
-                mask_tensor = torch.tensor(mask_list, dtype=torch.bool)
+                mask_list = [1 if x == cam_modality else 0 for x in agent_modality_list]
+                mask_tensor = torch.tensor(
+                    mask_list, dtype=torch.bool, device=spatial_features.device
+                )
                 cam_agent_mask_dict[cam_modality] = mask_tensor
 
                 # e.g. {m2: [0,0,0,1], m4: [0,1,0,0]}

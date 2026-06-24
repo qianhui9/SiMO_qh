@@ -202,6 +202,7 @@ model:
         density_weight: 0.35
         uncertainty_weight: 0.55
         history_weight: 0.10
+        occlusion_weight: 0.15
       supply:
         confidence_threshold: 0.01
         topk_ratio: null
@@ -212,7 +213,9 @@ model:
         max_comm_ratio: null
         bandwidth_mbps: null
         latency_ms: null
+        deadline_ms: null
         packet_loss: null
+        frame_rate_hz: 10.0
       redundancy:
         enabled: true
         demand_decay: 1.0
@@ -221,6 +224,8 @@ model:
         dense_zero_mask: true
         multiscale: true
         align_corners: false
+        export_sparse: false
+        return_dense_reconstructed_feature: false
       debug:
         log: false
         max_batches: 5

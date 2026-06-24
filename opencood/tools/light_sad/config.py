@@ -37,7 +37,7 @@ class LightSADConfig:
     camera_blur_thr: float = 0.02
     camera_good_brightness_thr: float = 0.20
 
-    # Network/compute placeholders. This prototype keeps real network traces out.
+    # Network/compute defaults used when no measured trace is provided.
     low_bandwidth_mbps: float = 5.0
     high_rtt_ms: float = 100.0
     deadline_ms: float = 100.0

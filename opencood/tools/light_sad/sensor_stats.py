@@ -315,7 +315,7 @@ def extract_network_stats_per_cav(data_dict: dict, record_len=None) -> Tuple[Lis
     per_cav = data_dict.get("network_state_per_cav", None)
     if isinstance(per_cav, list) and len(per_cav) >= total:
         return [dict(per_cav[i]) for i in range(total)], True, "network_state_per_cav"
-    return [extract_network_stats(data_dict).copy() for _ in range(total)], False, "default_good_network_broadcast"
+    return [extract_network_stats(data_dict).copy() for _ in range(total)], False, "network_state_default_broadcast"
 
 
 def _merge_global(per_cav_stats: List[Dict[str, Any]], default_fn) -> Dict[str, Any]:
