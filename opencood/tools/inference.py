@@ -36,6 +36,15 @@ def test_parser():
     parser.add_argument('--no_score', action='store_true',
                         help="whether print the score of prediction")
     parser.add_argument('--note', default="", type=str, help="any other thing?")
+    parser.add_argument("--light_sad_enable", action="store_true",
+                        help="Enable Light-SAD runtime modality scheduler.")
+    parser.add_argument("--light_sad_force_action", default=None,
+                        choices=["L", "C", "LC"],
+                        help="Force Light-SAD action for smoke test.")
+    parser.add_argument("--light_sad_log", action="store_true",
+                        help="Print Light-SAD action and reason.")
+    parser.add_argument("--light_sad_max_batches", type=int, default=None,
+                        help="Optional smoke-test limit.")
     opt = parser.parse_args()
     return opt
 
@@ -88,6 +97,14 @@ def main():
     if 'box_align' in hypes.keys():
         hypes['box_align']['val_result'] = hypes['box_align']['test_result']
 
+    if opt.light_sad_enable:
+        model_args = hypes["model"]["args"]
+        model_args["light_sad"] = model_args.get("light_sad", {})
+        model_args["light_sad"]["enabled"] = True
+        model_args["light_sad"]["policy"] = "force" if opt.light_sad_force_action else "emc2_rule"
+        model_args["light_sad"]["force_action"] = opt.light_sad_force_action
+        model_args["light_sad"]["log"] = opt.light_sad_log
+
     print('Creating Model')
     model = train_utils.create_model(hypes)
     # we assume gpu is necessary
@@ -138,6 +155,8 @@ def main():
 
 
     for i, batch_data in enumerate(data_loader):
+        if opt.light_sad_max_batches is not None and i >= opt.light_sad_max_batches:
+            break
         print(f"{infer_info}_{i}")
         if batch_data is None:
             continue

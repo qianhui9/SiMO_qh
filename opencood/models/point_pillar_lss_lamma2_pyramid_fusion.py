@@ -33,6 +33,12 @@ from opencood.utils.camera_utils import gen_dx_bx, cumsum_trick, QuickCumsum
 from opencood.models.sub_modules.lss_submodule import BevEncodeMSFusion, BevEncodeSSFusion, Up, CamEncode, BevEncode
 from matplotlib import pyplot as plt
 
+try:
+    from opencood.tools.light_sad import LightSADDispatcher, action_to_runtime_mask
+except Exception:
+    LightSADDispatcher = None
+    action_to_runtime_mask = None
+
 
 class PointPillarLSSLamma2PyramidFusion(nn.Module):
     """
@@ -44,6 +50,16 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         modality_name_list = list(args.keys())
         modality_name_list = [x for x in modality_name_list if x.startswith("m") and x[1:].isdigit()] 
         self.modality_name_list = modality_name_list
+
+        self.light_sad_enabled = False
+        self.light_sad = None
+        light_sad_cfg = args.get("light_sad", None)
+        if light_sad_cfg and light_sad_cfg.get("enabled", False):
+            if LightSADDispatcher is None or action_to_runtime_mask is None:
+                raise ImportError("LightSADDispatcher import failed.")
+            self.light_sad_enabled = True
+            self.light_sad = LightSADDispatcher(light_sad_cfg)
+            print("[Light-SAD] enabled:", light_sad_cfg)
 
         self.cav_range = args['lidar_range']
         self.sensor_type_dict = OrderedDict()
@@ -252,6 +268,16 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
 
     def forward(self, data_dict):
         output_dict = {'pyramid': 'collab'}
+        light_sad_info = None
+        light_sad_action = "LC"
+        if self.light_sad_enabled:
+            light_sad_info = self.light_sad.dispatch(data_dict, record_len=data_dict.get("record_len", None))
+            light_sad_action = light_sad_info["action"]
+            if self.light_sad.cfg.log:
+                print(f"[Light-SAD] action={light_sad_action}, reason={light_sad_info.get('reason')}")
+        run_lidar = light_sad_action in ["L", "LC"]
+        run_camera = light_sad_action in ["C", "LC"]
+
         # agent_modality_list = data_dict['agent_modality_list'] 
         agent_modality_list = ['m1', 'm2']
         affine_matrix = normalize_pairwise_tfm(data_dict['pairwise_t_matrix'], self.H, self.W, self.fake_voxel_size)
@@ -261,9 +287,11 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
 
         for modality_name in self.modality_name_list:
             if modality_name == 'm1':
-                data_dict[f"inputs_{modality_name}"] = data_dict.pop('processed_lidar')
+                if 'processed_lidar' in data_dict:
+                    data_dict[f"inputs_{modality_name}"] = data_dict.pop('processed_lidar')
             elif modality_name == 'm2':
-                data_dict[f"inputs_{modality_name}"] = data_dict.pop('image_inputs')
+                if 'image_inputs' in data_dict:
+                    data_dict[f"inputs_{modality_name}"] = data_dict.pop('image_inputs')
             else:
                 raise ValueError(f"Modality name {modality_name} not supported.")
 
@@ -272,6 +300,10 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
 
         for modality_name in self.modality_name_list:   
             if modality_name not in modality_count_dict:
+                continue
+            if modality_name == "m1" and not run_lidar:
+                continue
+            if modality_name == "m2" and not run_camera:
                 continue
 
             if eval(f"self.encoder_{modality_name}_freeze"):
@@ -296,7 +328,7 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         Crop/Padd camera feature map.
         """
         for modality_name in self.modality_name_list:
-            if modality_name in modality_count_dict:
+            if modality_name in modality_count_dict and modality_name in modality_feature_dict:
                 if self.sensor_type_dict[modality_name] == "camera":
                     # should be padding. Instead of masking
                     feature = modality_feature_dict[modality_name]
@@ -315,16 +347,32 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
         Fuse multimodalities.
         """
         if self.mm_pool_method == 'max' or self.mm_pool_method == 'avg':
-            pc_feature = self.mm_pooling(modality_feature_dict['m1'])
-            img_fused_feature = self.mm_pooling(modality_feature_dict['m2'])
+            pc_feature = self.mm_pooling(modality_feature_dict['m1']) if run_lidar else None
+            img_fused_feature = self.mm_pooling(modality_feature_dict['m2']) if run_camera else None
         else:
-            pc_feature = modality_feature_dict['m1']
-            img_fused_feature = modality_feature_dict['m2']
+            pc_feature = modality_feature_dict['m1'] if run_lidar else None
+            img_fused_feature = modality_feature_dict['m2'] if run_camera else None
+
+        if pc_feature is None and img_fused_feature is None:
+            raise RuntimeError("Light-SAD disabled both modalities, not supported in module-1.")
+        if pc_feature is None:
+            pc_feature = torch.zeros_like(img_fused_feature)
+        if img_fused_feature is None:
+            img_fused_feature = torch.zeros_like(pc_feature)
 
         pc_feature = torch.stack(self.regroup(pc_feature, record_len)) # torch.Size([1, 3, 64, 64, 64])
         img_fused_feature = torch.stack(self.regroup(img_fused_feature, record_len)) # torch.Size([1, 3, 64, 64, 64])
+        runtime_modality_mask = None
+        if self.light_sad_enabled:
+            B = pc_feature.shape[0]
+            N = pc_feature.shape[1]
+            runtime_modality_mask = action_to_runtime_mask(light_sad_action, B, N, pc_feature.device)
         # mm_feature_2d, _, _ = self.mm_fusion(pc_feature, img_fused_feature)
-        mm_feature_2d, _, _ = self.mm_fusion(img_fused_feature, pc_feature) # torch.Size([3, 64, 64, 64])
+        mm_feature_2d, _, _ = self.mm_fusion(
+            img_fused_feature,
+            pc_feature,
+            runtime_modality_mask=runtime_modality_mask
+        ) # torch.Size([3, 64, 64, 64])
 
         if self.compress:
             mm_feature_2d = self.compressor(mm_feature_2d)
@@ -355,6 +403,9 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
                             'dir_preds': dir_preds,
                             'pc_feature': pc_feature,
                             'img_feature': img_fused_feature,})
+        if light_sad_info is not None:
+            output_dict["light_sad_action"] = light_sad_action
+            output_dict["light_sad_reason"] = light_sad_info.get("reason", "")
         
         output_dict.update({'occ_single_list': 
                             occ_outputs})

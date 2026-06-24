@@ -171,3 +171,4 @@ opencood/features_lamma
 
 # SiMO internal
 .sisyphus/
+*.pth

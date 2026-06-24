@@ -138,7 +138,24 @@ class LAMMA3(nn.Module):
                 nn.ReLU(),
                 nn.ConvTranspose2d(dim, feat_dim, 2, stride=2, bias=False))
 
-    def forward(self, cam_feat, lidar_feat):
+    def _apply_runtime_mask(self, cam_embed, lidar_embed, runtime_modality_mask, B, N):
+        if runtime_modality_mask is None:
+            return cam_embed, lidar_embed
+
+        cam_mask = runtime_modality_mask.get("camera", None)
+        lidar_mask = runtime_modality_mask.get("lidar", None)
+
+        if cam_mask is not None:
+            cam_mask = cam_mask.to(device=cam_embed.device, dtype=cam_embed.dtype).view(B * N, 1, 1, 1)
+            cam_embed = cam_embed * cam_mask
+
+        if lidar_mask is not None:
+            lidar_mask = lidar_mask.to(device=lidar_embed.device, dtype=lidar_embed.dtype).view(B * N, 1, 1, 1)
+            lidar_embed = lidar_embed * lidar_mask
+
+        return cam_embed, lidar_embed
+
+    def forward(self, cam_feat, lidar_feat, runtime_modality_mask=None):
         # feature shape: torch.Size([1, 3, 64, 64, 64])
         B, N, C, Y, X = lidar_feat.shape 
         assert cam_feat.shape == lidar_feat.shape, "cam_feat and lidar_feat should have the same shape"
@@ -157,21 +174,26 @@ class LAMMA3(nn.Module):
         lidar_embed = self.feature_proj(lidar_feat)                                     # (b l) d h w
         # print(cam_embed.shape, lidar_embed.shape)
 
-        mask = torch.zeros_like(lidar_embed)
-        if self.single_mode == 'camera':
-            # print('lidar drop')
-            lidar_embed *= mask
-        elif self.single_mode == 'lidar':
-            cam_embed *= mask
-        elif self.random_drop:
-            # in training, to adapt to modality drop out, 
-            # with 0.5 to drop lidar or camera (drop lidar features with lidar_drop_ratio)
-            # with 0.5 applying two modalities
-            if random.random() >= 0.5:
-                if self.lidar_drop_ratio >= random.random():
-                    lidar_embed *= mask
-                else:
-                    cam_embed *= mask
+        if runtime_modality_mask is not None:
+            cam_embed, lidar_embed = self._apply_runtime_mask(
+                cam_embed, lidar_embed, runtime_modality_mask, B, N
+            )
+        else:
+            mask = torch.zeros_like(lidar_embed)
+            if self.single_mode == 'camera':
+                # print('lidar drop')
+                lidar_embed *= mask
+            elif self.single_mode == 'lidar':
+                cam_embed *= mask
+            elif self.random_drop:
+                # in training, to adapt to modality drop out,
+                # with 0.5 to drop lidar or camera (drop lidar features with lidar_drop_ratio)
+                # with 0.5 applying two modalities
+                if random.random() >= 0.5:
+                    if self.lidar_drop_ratio >= random.random():
+                        lidar_embed *= mask
+                    else:
+                        cam_embed *= mask
 
         # query = rearrange(query, '(b l) d h w -> b l d (h w)', b=B, l=N)                # b l d (h w)
         cam_flat = rearrange(cam_embed, '(b l) d h w -> b l d (h w)', b=B, l=N)         # b l d (h w)
