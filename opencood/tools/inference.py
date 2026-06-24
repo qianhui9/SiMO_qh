@@ -31,8 +31,8 @@ def test_parser():
     parser.add_argument('--save_npy', action='store_true',
                         help='whether to save prediction and gt result'
                              'in npy file')
-    parser.add_argument('--range', type=str, default="102.4,102.4",
-                        help="detection range is [-102.4, +102.4, -102.4, +102.4]")
+    parser.add_argument('--range', type=str, default=None,
+                        help="Optional override for detection range, e.g. 51.2,51.2. If omitted, use the checkpoint/config range.")
     parser.add_argument('--no_score', action='store_true',
                         help="whether print the score of prediction")
     parser.add_argument('--note', default="", type=str, help="any other thing?")
@@ -56,7 +56,7 @@ def main():
 
     hypes = yaml_utils.load_yaml(None, opt)
 
-    if 'heter' in hypes:
+    if 'heter' in hypes and opt.range is not None:
         # hypes['heter']['lidar_channels'] = 16
         # opt.note += "_16ch"
 
