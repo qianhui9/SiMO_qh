@@ -4,8 +4,8 @@
 
 from os.path import dirname, realpath
 from setuptools import setup, find_packages, Distribution
-from opencood.version import __version__
-
+# from opencood.version import __version__
+__version__ = '0.1.0'
 
 def _read_requirements_file():
     """Return the elements in requirements.txt."""

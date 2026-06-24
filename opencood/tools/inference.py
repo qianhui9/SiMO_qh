@@ -15,7 +15,7 @@ import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.tools import train_utils, inference_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.utils import eval_utils
-from opencood.visualization import vis_utils, my_vis, simple_vis
+from opencood.visualization import vis_utils, simple_vis
 from opencood.utils.common_utils import update_dict
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -113,7 +113,7 @@ def main():
     # data_loader = DataLoader(opencood_dataset_subset,
     data_loader = DataLoader(opencood_dataset,
                             batch_size=1,
-                            num_workers=4,
+                            num_workers=0,
                             collate_fn=opencood_dataset.collate_batch_test,
                             shuffle=False,
                             pin_memory=False,

@@ -218,3 +218,7 @@ class LAMMA3(nn.Module):
 #     lamma = LAMMA3(args, H=20, W=20)
 
 #     print(lamma(test_1, test_2)[0].shape)
+
+# Backward-compatible aliases for older model configs that import LAMMA/LAMMA2.
+LAMMA = LAMMA3
+LAMMA2 = LAMMA3
