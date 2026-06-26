@@ -1,0 +1,37 @@
+{
+  "classification_accuracy": 0.4057624960203757,
+  "top2_accuracy": 0.8319006685768864,
+  "macro_f1": 0.27809202115468584,
+  "oracle_utility": -0.21191959257336349,
+  "predicted_utility": -0.22241660158290144,
+  "utility_regret": 0.010497009010723975,
+  "action_distribution": {
+    "L": 1193,
+    "C": 358,
+    "LC": 4731
+  },
+  "label_distribution": {
+    "L": 3216,
+    "C": 479,
+    "LC": 2587
+  },
+  "confusion_matrix": [
+    [
+      599,
+      176,
+      2441
+    ],
+    [
+      111,
+      14,
+      354
+    ],
+    [
+      483,
+      168,
+      1936
+    ]
+  ],
+  "confidence_mean": 0.4883157978417273,
+  "confidence_std": 0.06073060631752014
+}

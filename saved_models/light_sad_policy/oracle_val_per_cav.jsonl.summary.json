@@ -1,13 +1,26 @@
 {
   "output_path": "saved_models/light_sad_policy/oracle_val_per_cav.jsonl",
   "action_distribution": {
-    "L": 0,
-    "C": 400,
-    "LC": 0
+    "L": 3216,
+    "C": 479,
+    "LC": 2587
+  },
+  "quality_best_distribution": {
+    "L": 2870,
+    "C": 461,
+    "LC": 2951
   },
   "actions": [
     "L",
     "C",
     "LC"
-  ]
+  ],
+  "cost_weights": {
+    "lambda_compute": 0.0005,
+    "lambda_comm": 0.0005,
+    "lambda_latency": 0.0002,
+    "lidar_payload_norm_voxels": 10000.0,
+    "min_payload_scale": 0.25,
+    "max_payload_scale": 2.0
+  }
 }
