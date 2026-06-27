@@ -238,10 +238,33 @@ model:
         method: vra
         num_virtual_receivers: 8
         virtual_receiver_mode: fixed
+        learnable_alpha: 0.1
+        learnable_temperature: true
+        learnable_prior_scale: true
+        prior_scale_alpha: 0.25
+        learnable_ckpt: null
         use_vra: true
         use_soft_or_fallback: true
         budget_ratio: 0.3
         use_modality_reliability: true
+        distill:
+          enabled: false
+          teacher_mode: pairwise
+          freeze_backbone: true
+          trainable_scope: virtual_receiver
+          use_detection_loss: false
+          lambda_cover: 1.0
+          lambda_budget: 0.1
+          lambda_inv: 0.05
+          lambda_det: 0.0
+          teacher_score_type: mask
+          student_score_type: utility
+          hard_topk_for_loss: false
+          token_dropout: 0.0
+          token_noise_std: 0.0
+          max_train_iters: null
+          log_interval: 20
+          save_interval: 1
         receiver_gating:
           enabled: false
           source: uncertainty

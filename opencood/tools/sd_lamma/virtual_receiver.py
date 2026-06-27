@@ -47,20 +47,41 @@ class VirtualReceiverAttention(nn.Module):
         mode: str = "fixed",
         radius: float = 1.0,
         temperature: float = 1.0,
+        learnable_alpha: float = 0.1,
+        train_temperature: bool = True,
+        train_prior_scale: bool = True,
+        prior_scale_alpha: float = 0.25,
     ):
         super().__init__()
         self.num_virtual_receivers = max(1, int(num_virtual_receivers))
         self.mode = str(mode or "fixed").lower()
         self.temperature = max(float(temperature), 1.0e-3)
+        self.learnable_alpha = max(float(learnable_alpha), 0.0)
+        self.prior_scale_alpha = max(float(prior_scale_alpha), 0.0)
 
         tokens = _direction_table(self.num_virtual_receivers, float(radius))
         self.register_buffer("base_tokens", tokens, persistent=False)
         if self.mode == "learnable":
             self.token_delta = nn.Parameter(torch.zeros_like(tokens))
+            if bool(train_temperature):
+                self.log_temperature_delta = nn.Parameter(torch.zeros(1))
+            else:
+                self.register_parameter("log_temperature_delta", None)
+            if bool(train_prior_scale):
+                self.prior_scale_delta = nn.Parameter(torch.zeros(1))
+            else:
+                self.register_parameter("prior_scale_delta", None)
         else:
             self.register_parameter("token_delta", None)
+            self.register_parameter("log_temperature_delta", None)
+            self.register_parameter("prior_scale_delta", None)
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        features: torch.Tensor,
+        token_dropout: float = 0.0,
+        token_noise_std: float = 0.0,
+    ) -> torch.Tensor:
         if features.dim() != 4:
             raise ValueError("VirtualReceiverAttention expects [N, C, H, W].")
 
@@ -78,10 +99,17 @@ class VirtualReceiverAttention(nn.Module):
             dim=1,
         )
 
-        tokens = self._tokens(device=features.device, dtype=features.dtype)
+        tokens = self._tokens(
+            device=features.device,
+            dtype=features.dtype,
+            token_dropout=token_dropout,
+            token_noise_std=token_noise_std,
+        )
         keys = tokens[:, :4]
-        values = tokens[:, 3].clamp(0.0, 1.0)
-        logits = torch.einsum("nchw,kc->nkhw", query, keys) / self.temperature
+        values = self._scaled_prior(tokens[:, 3]).clamp(0.0, 1.0)
+        logits = torch.einsum("nchw,kc->nkhw", query, keys) / self._temperature(
+            features.device, features.dtype
+        )
         attn = torch.softmax(logits, dim=1)
         spatial_demand = (attn * values.view(1, -1, 1, 1)).sum(dim=1, keepdim=True)
         demand = 0.55 * spatial_demand + 0.45 * energy
@@ -103,17 +131,78 @@ class VirtualReceiverAttention(nn.Module):
         demand = 0.50 * soft_or.expand_as(energy) + 0.50 * energy
         return self._normalize_map(demand).clamp(0.0, 1.0)
 
-    def _tokens(self, device, dtype) -> torch.Tensor:
+    def _tokens(
+        self,
+        device,
+        dtype,
+        token_dropout: float = 0.0,
+        token_noise_std: float = 0.0,
+    ) -> torch.Tensor:
         tokens = self.base_tokens.to(device=device, dtype=dtype)
         if self.token_delta is not None:
-            delta = torch.tanh(self.token_delta.to(device=device, dtype=dtype)) * 0.25
+            delta = torch.tanh(self.token_delta.to(device=device, dtype=dtype)) * self.learnable_alpha
             tokens = tokens + delta
+        if self.training and float(token_noise_std or 0.0) > 0.0:
+            tokens = tokens + torch.randn_like(tokens) * float(token_noise_std)
+        if self.training and float(token_dropout or 0.0) > 0.0 and tokens.shape[0] > 1:
+            keep_prob = 1.0 - max(0.0, min(1.0, float(token_dropout)))
+            keep = (torch.rand((tokens.shape[0], 1), device=device, dtype=dtype) < keep_prob).to(dtype)
+            if bool((keep.sum() <= 0).item()):
+                keep[0].fill_(1.0)
+            tokens = tokens.clone()
+            tokens[:, 3:4] = tokens[:, 3:4] * keep
         direction = tokens[:, :2]
         direction = direction / torch.clamp(direction.norm(dim=1, keepdim=True), min=1.0e-6)
         dist_prior = tokens[:, 2:].clone()
         dist_prior[:, 0].clamp_(0.0, 2.0)
         dist_prior[:, 1].clamp_(0.0, 1.0)
         return torch.cat([direction, dist_prior], dim=1)
+
+    def _temperature(self, device, dtype) -> torch.Tensor:
+        value = torch.tensor(self.temperature, device=device, dtype=dtype)
+        if self.log_temperature_delta is not None:
+            delta = self.log_temperature_delta.to(device=device, dtype=dtype)
+            value = value * torch.exp(0.25 * torch.tanh(delta))
+        return torch.clamp(value, min=1.0e-3)
+
+    def _scaled_prior(self, prior: torch.Tensor) -> torch.Tensor:
+        if self.prior_scale_delta is None:
+            return prior
+        scale = 1.0 + self.prior_scale_alpha * torch.tanh(
+            self.prior_scale_delta.to(device=prior.device, dtype=prior.dtype)
+        )
+        return prior * scale
+
+    def learnable_stats(self) -> dict:
+        stats = {
+            "virtual_receiver_mode": self.mode,
+            "num_virtual_receivers": int(self.num_virtual_receivers),
+            "learnable_alpha": float(self.learnable_alpha),
+        }
+        if self.token_delta is not None:
+            delta = self.token_delta.detach().float()
+            stats["learnable_delta_norm"] = float(delta.norm().item())
+            stats["learnable_delta_max_abs"] = float(delta.abs().max().item())
+        else:
+            stats["learnable_delta_norm"] = 0.0
+            stats["learnable_delta_max_abs"] = 0.0
+        if self.log_temperature_delta is not None:
+            stats["learnable_temperature"] = float(
+                self._temperature(
+                    self.log_temperature_delta.device,
+                    self.log_temperature_delta.dtype,
+                ).detach().item()
+            )
+        else:
+            stats["learnable_temperature"] = float(self.temperature)
+        if self.prior_scale_delta is not None:
+            scale = 1.0 + self.prior_scale_alpha * torch.tanh(
+                self.prior_scale_delta.detach().float()
+            )
+            stats["learnable_prior_scale"] = float(scale.item())
+        else:
+            stats["learnable_prior_scale"] = 1.0
+        return stats
 
     @staticmethod
     def _feature_energy(features: torch.Tensor) -> torch.Tensor:

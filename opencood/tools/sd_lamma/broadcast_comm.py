@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from opencood.models.sub_modules.torch_transformation_utils import warp_affine_simple
 from .comm import SupplyDemandLAMMAComm, _record_len_to_list
+from .broadcast_distill import BroadcastDistillationLoss
 from .virtual_receiver import VirtualReceiverAttention
 
 
@@ -31,14 +32,27 @@ class BroadcastSupplyDemandLAMMAComm(SupplyDemandLAMMAComm):
         self.num_virtual_receivers = int(self.broadcast_cfg.get("num_virtual_receivers", 8))
         self.num_virtual_receivers = max(1, self.num_virtual_receivers)
         self.broadcast_method = str(self.broadcast_cfg.get("method", "vra")).lower()
+        self.virtual_receiver_mode = str(
+            self.broadcast_cfg.get("virtual_receiver_mode", "fixed")
+        ).lower()
         self.use_vra = bool(self.broadcast_cfg.get("use_vra", self.broadcast_method == "vra"))
         self.use_soft_or_fallback = bool(self.broadcast_cfg.get("use_soft_or_fallback", True))
+        self.distill_cfg = self.broadcast_cfg.get("distill", {}) or {}
+        self.distill_enabled = bool(self.distill_cfg.get("enabled", False))
+        self.distill_loss = BroadcastDistillationLoss(self.distill_cfg) if self.distill_enabled else None
+        self._distill_teacher_warned = False
         self.virtual_receiver = VirtualReceiverAttention(
             num_virtual_receivers=self.num_virtual_receivers,
-            mode=str(self.broadcast_cfg.get("virtual_receiver_mode", "fixed")),
+            mode=self.virtual_receiver_mode,
             radius=float(self.broadcast_cfg.get("virtual_receiver_radius", 1.0)),
             temperature=float(self.broadcast_cfg.get("vra_temperature", 1.0)),
+            learnable_alpha=float(self.broadcast_cfg.get("learnable_alpha", 0.1)),
+            train_temperature=bool(self.broadcast_cfg.get("learnable_temperature", True)),
+            train_prior_scale=bool(self.broadcast_cfg.get("learnable_prior_scale", True)),
+            prior_scale_alpha=float(self.broadcast_cfg.get("prior_scale_alpha", 0.25)),
         )
+        if self.virtual_receiver_mode == "learnable" and not self.broadcast_cfg.get("learnable_ckpt", None):
+            print("[BROAD-SD-LAMMA] learnable virtual receiver uses fixed-like zero delta init.")
 
     def forward(
         self,
@@ -137,6 +151,26 @@ class BroadcastSupplyDemandLAMMAComm(SupplyDemandLAMMAComm):
         debug["modality_reliability"] = [
             float(x) for x in reliability.detach().view(-1).cpu().tolist()
         ]
+        if hasattr(self.virtual_receiver, "learnable_stats"):
+            debug.update(self.virtual_receiver.learnable_stats())
+
+        distill_debug = self._maybe_compute_distill_loss(
+            features,
+            record_len,
+            affine_matrix,
+            data_dict,
+            light_sad_info,
+            runtime_modality_mask,
+            confidence,
+            reliability,
+            actions,
+            broadcast_demand,
+            broadcast_utility,
+            comm_mask,
+            confidence_head,
+        )
+        if distill_debug is not None:
+            debug.update(distill_debug)
 
         teacher_overlap = self._maybe_pairwise_teacher_overlap(
             features,
@@ -176,12 +210,21 @@ class BroadcastSupplyDemandLAMMAComm(SupplyDemandLAMMAComm):
         self._maybe_log(debug)
         return masked_features, debug
 
-    def _build_broadcast_demand(self, features: torch.Tensor) -> torch.Tensor:
+    def _build_broadcast_demand(
+        self,
+        features: torch.Tensor,
+        token_dropout: float = 0.0,
+        token_noise_std: float = 0.0,
+    ) -> torch.Tensor:
         method = str(self.broadcast_cfg.get("method", self.broadcast_method)).lower()
         use_vra = bool(self.broadcast_cfg.get("use_vra", self.use_vra))
         if method == "vra" and use_vra:
             try:
-                return self.virtual_receiver(features)
+                return self.virtual_receiver(
+                    features,
+                    token_dropout=token_dropout,
+                    token_noise_std=token_noise_std,
+                )
             except Exception:
                 if not self.use_soft_or_fallback:
                     raise
@@ -370,6 +413,87 @@ class BroadcastSupplyDemandLAMMAComm(SupplyDemandLAMMAComm):
             "redundancy_enabled": False,
             "dense_zero_mask": bool(self.mask_cfg.get("dense_zero_mask", True)),
         }
+
+    def _maybe_compute_distill_loss(
+        self,
+        features: torch.Tensor,
+        record_len,
+        affine_matrix: torch.Tensor,
+        data_dict: Optional[Dict[str, Any]],
+        light_sad_info: Optional[Dict[str, Any]],
+        runtime_modality_mask: Optional[Dict[str, torch.Tensor]],
+        confidence: torch.Tensor,
+        reliability: torch.Tensor,
+        actions: List[str],
+        broadcast_demand: torch.Tensor,
+        broadcast_utility: torch.Tensor,
+        broadcast_mask: torch.Tensor,
+        confidence_head: Optional[nn.Module],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.distill_enabled or self.distill_loss is None:
+            return None
+
+        teacher_info = None
+        try:
+            with torch.no_grad():
+                teacher_info = self.export_pairwise_teacher(
+                    features,
+                    record_len,
+                    affine_matrix,
+                    data_dict=data_dict,
+                    light_sad_info=light_sad_info,
+                    runtime_modality_mask=runtime_modality_mask,
+                    confidence=confidence,
+                    reliability=reliability,
+                    actions=actions,
+                    confidence_head=confidence_head,
+                )
+        except Exception as exc:
+            if not self._distill_teacher_warned:
+                print(f"[BROAD-SD-LAMMA] pairwise teacher export failed; using budget/invariance only: {exc}")
+                self._distill_teacher_warned = True
+
+        student = {
+            "broadcast_demand": broadcast_demand,
+            "broadcast_utility": broadcast_utility,
+            "broadcast_mask": broadcast_mask,
+        }
+        lambda_inv = float(self.distill_cfg.get("lambda_inv", 0.0))
+        token_dropout = float(self.distill_cfg.get("token_dropout", 0.0) or 0.0)
+        token_noise_std = float(self.distill_cfg.get("token_noise_std", 0.0) or 0.0)
+        if lambda_inv > 0.0 and (token_dropout > 0.0 or token_noise_std > 0.0):
+            aug_demand = self._build_broadcast_demand(
+                features,
+                token_dropout=token_dropout,
+                token_noise_std=token_noise_std,
+            ).to(device=features.device, dtype=features.dtype)
+            student["broadcast_demand_aug"] = aug_demand
+            utility_scale = (
+                broadcast_utility / torch.clamp(broadcast_demand.detach(), min=1.0e-6)
+            ).detach()
+            student["broadcast_utility_aug"] = (utility_scale * aug_demand).clamp(0.0, 1.0)
+
+        budget_ratio = self._broadcast_budget_ratio(features.shape[-2] * features.shape[-1])
+        loss, metrics = self.distill_loss(
+            student,
+            teacher_info,
+            record_len=record_len,
+            budget_ratio=budget_ratio,
+        )
+        debug: Dict[str, Any] = {
+            "distill_enabled": True,
+            "distill_teacher_available": teacher_info is not None,
+            "distill_loss_total": loss,
+            "broadcast_budget_ratio": float(budget_ratio) if budget_ratio is not None else 0.0,
+        }
+        for key, value in metrics.items():
+            debug[key] = value
+            debug[f"distill_{key}"] = value
+        if teacher_info is not None:
+            debug["pairwise_teacher_selected_cells"] = int(
+                teacher_info.get("teacher_selected_cells", 0)
+            )
+        return debug
 
     def _maybe_pairwise_teacher_overlap(
         self,

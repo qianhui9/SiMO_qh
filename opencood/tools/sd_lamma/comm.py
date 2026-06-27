@@ -180,6 +180,145 @@ class SupplyDemandLAMMAComm(nn.Module):
         self._maybe_log(debug)
         return masked_features, debug
 
+    def export_pairwise_teacher(
+        self,
+        features: torch.Tensor,
+        record_len,
+        affine_matrix: torch.Tensor,
+        data_dict: Optional[Dict[str, Any]] = None,
+        light_sad_info: Optional[Dict[str, Any]] = None,
+        runtime_modality_mask: Optional[Dict[str, torch.Tensor]] = None,
+        confidence: Optional[torch.Tensor] = None,
+        reliability: Optional[torch.Tensor] = None,
+        actions: Optional[List[str]] = None,
+        confidence_head: Optional[nn.Module] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Export no-grad pairwise teacher masks in sender coordinates."""
+        if not self.enabled or features is None:
+            return None
+        if features.dim() != 4:
+            raise ValueError("SD-LAMMA teacher export expects [sum_cav, C, H, W] features.")
+
+        lengths = _record_len_to_list(record_len)
+        if not lengths:
+            lengths = [features.shape[0]]
+        total_cavs = int(sum(lengths))
+        if total_cavs != features.shape[0]:
+            raise ValueError(
+                "SD-LAMMA record_len sum %d does not match features %d."
+                % (total_cavs, features.shape[0])
+            )
+
+        self._active_network_state = self._extract_network_state(data_dict, light_sad_info)
+        self._active_channels = int(features.shape[1])
+        self._active_dtype_bits = self._dtype_bits(features.dtype)
+
+        if confidence is None:
+            confidence = self._build_confidence(features, confidence_head)
+        if reliability is None:
+            reliability = self._extract_reliability(
+                light_sad_info,
+                runtime_modality_mask,
+                total_cavs,
+                features.device,
+                features.dtype,
+            )
+        if actions is None:
+            actions = self._extract_actions(light_sad_info, total_cavs)
+
+        lidar_active = self._extract_lidar_active(runtime_modality_mask, total_cavs, features.device)
+        demand_score = self._build_demand_score(
+            features, confidence, record_len, data_dict, lidar_active, light_sad_info
+        )
+        demand_mask = self._binary_from_score(
+            demand_score,
+            threshold=float(self.demand_cfg.get("uncertainty_threshold", 0.5)),
+            topk_ratio=self.demand_cfg.get("topk_ratio", None),
+        )
+        supply_score = self._build_supply_score(confidence, reliability)
+        supply_mask = self._binary_from_score(
+            supply_score,
+            threshold=float(self.supply_cfg.get("confidence_threshold", 0.01)),
+            topk_ratio=self.supply_cfg.get("topk_ratio", None),
+        )
+
+        split_features = self._split(features, lengths)
+        split_demand_score = self._split(demand_score, lengths)
+        split_demand_mask = self._split(demand_mask.float(), lengths)
+        split_supply = self._split(supply_score, lengths)
+        split_supply_mask = self._split(supply_mask.float(), lengths)
+
+        teacher_masks = []
+        teacher_utilities = []
+        sample_summaries = []
+        offset = 0
+        for batch_idx, cav_num in enumerate(lengths):
+            sample_actions = actions[offset: offset + cav_num]
+            _, teacher_mask, sample_debug = self._mask_one_sample(
+                split_features[batch_idx],
+                split_demand_score[batch_idx],
+                split_demand_mask[batch_idx],
+                split_supply[batch_idx],
+                split_supply_mask[batch_idx],
+                affine_matrix[batch_idx, :cav_num, :cav_num],
+                sample_actions,
+            )
+            teacher_masks.append(teacher_mask)
+            teacher_utilities.append(
+                self._pairwise_teacher_utility_one_sample(
+                    split_demand_score[batch_idx],
+                    split_supply[batch_idx],
+                    affine_matrix[batch_idx, :cav_num, :cav_num],
+                )
+            )
+            sample_summaries.append(sample_debug)
+            offset += cav_num
+
+        teacher_mask = torch.cat(teacher_masks, dim=0).detach()
+        teacher_utility = torch.cat(teacher_utilities, dim=0).detach().clamp(0.0, 1.0)
+        debug = self._summarize(
+            sample_summaries,
+            teacher_mask,
+            features.shape[1],
+            features.dtype,
+            actions,
+        )
+        return {
+            "teacher_mask": teacher_mask,
+            "teacher_utility": teacher_utility,
+            "teacher_selected_ratio": debug.get("communication_rate", 0.0),
+            "teacher_selected_cells": debug.get("selected_cells", 0),
+            "teacher_total_collab_cells": debug.get("total_collab_cells", 0),
+            "teacher_debug": debug,
+        }
+
+    def _pairwise_teacher_utility_one_sample(
+        self,
+        demand_score: torch.Tensor,
+        supply_score: torch.Tensor,
+        t_matrix: torch.Tensor,
+    ) -> torch.Tensor:
+        cav_num, _, height, width = supply_score.shape
+        utility_sender = torch.zeros_like(supply_score)
+        if cav_num <= 1:
+            return utility_sender
+        supply_in_ego = warp_affine_simple(
+            supply_score,
+            t_matrix[0, :cav_num],
+            (height, width),
+            align_corners=self.align_corners,
+        )
+        utility_ego = supply_in_ego * demand_score[0:1]
+        utility_ego[0].zero_()
+        utility_sender = warp_affine_simple(
+            utility_ego,
+            t_matrix[:cav_num, 0],
+            (height, width),
+            align_corners=self.align_corners,
+        ).clamp(0.0, 1.0)
+        utility_sender[0].zero_()
+        return utility_sender
+
     @staticmethod
     def _split(x: torch.Tensor, lengths: List[int]) -> List[torch.Tensor]:
         if len(lengths) == 1:

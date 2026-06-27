@@ -153,3 +153,21 @@ python opencood/tools/inference.py \
   --sd_lamma_max_comm_ratio 0.3 \
   --light_sad_max_batches 10
 ```
+
+## BROAD-SD-LAMMA learnable VRA 蒸馏
+
+`virtual_receiver_mode=learnable` 现在支持 Pairwise Teacher 蒸馏训练。核心说明见 `opencood/tools/sd_lamma/BROAD_SD_LAMMA_DISTILL.md`。
+
+最小 dry-run：
+
+```bash
+cd /data/qh/phdCode/work3/SiMO_qh
+conda activate SiMO_qh
+python opencood/tools/train_broad_sd_lamma_distill.py   --hypes_yaml opencood/hypes_yaml/opv2v/MoreModality/lidar_camera_lamma3_pyramid_fusion.yaml   --model_dir saved_models/SiMO-PF   --sd_lamma_max_comm_ratio 0.3   --broad_sd_dry_run   --broad_sd_max_train_iters 2   --broad_sd_log_interval 1
+```
+
+learnable checkpoint 推理：
+
+```bash
+python opencood/tools/inference.py   --model_dir saved_models/SiMO-PF   --fusion_method intermediate   --sd_lamma_broadcast_enable   --sd_lamma_broadcast_method vra   --sd_lamma_virtual_receiver_mode learnable   --sd_lamma_learnable_ckpt opencood/logs/<run>/broad_sd_lamma_learnable_latest.pth   --sd_lamma_max_comm_ratio 0.3   --sd_lamma_log   --light_sad_max_batches 2
+```

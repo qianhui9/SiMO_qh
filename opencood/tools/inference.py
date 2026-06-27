@@ -21,6 +21,10 @@ try:
     from opencood.tools.light_sad import HistoryConfidenceBuffer
 except Exception:
     HistoryConfidenceBuffer = None
+try:
+    from opencood.tools.sd_lamma import load_broadcast_learnable_checkpoint_from_config
+except Exception:
+    load_broadcast_learnable_checkpoint_from_config = None
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 def test_parser():
@@ -109,6 +113,13 @@ def test_parser():
                         help="Broadcast demand estimator.")
     parser.add_argument("--sd_lamma_num_virtual_receivers", type=int, default=None,
                         help="Number of virtual receiver tokens for BROAD-SD-LAMMA.")
+    parser.add_argument("--sd_lamma_virtual_receiver_mode", default=None,
+                        choices=["fixed", "learnable"],
+                        help="Virtual receiver mode for BROAD-SD-LAMMA.")
+    parser.add_argument("--sd_lamma_learnable_alpha", type=float, default=None,
+                        help="Max tanh(delta) correction scale for learnable virtual receiver tokens.")
+    parser.add_argument("--sd_lamma_learnable_ckpt", default=None,
+                        help="Lightweight BROAD-SD-LAMMA learnable virtual receiver checkpoint.")
     parser.add_argument("--sd_lamma_receiver_gating", action="store_true",
                         help="Enable ego-side local gating after receiving broadcast messages.")
     parser.add_argument("--sd_lamma_save_broadcast_debug", action="store_true",
@@ -207,6 +218,9 @@ def main():
         opt.sd_lamma_broadcast_enable,
         opt.sd_lamma_broadcast_method is not None,
         opt.sd_lamma_num_virtual_receivers is not None,
+        opt.sd_lamma_virtual_receiver_mode is not None,
+        opt.sd_lamma_learnable_alpha is not None,
+        opt.sd_lamma_learnable_ckpt is not None,
         opt.sd_lamma_receiver_gating,
         opt.sd_lamma_save_broadcast_debug,
     ])
@@ -248,6 +262,12 @@ def main():
             sd_cfg["broadcast"]["use_vra"] = opt.sd_lamma_broadcast_method == "vra"
         if opt.sd_lamma_num_virtual_receivers is not None:
             sd_cfg["broadcast"]["num_virtual_receivers"] = opt.sd_lamma_num_virtual_receivers
+        if opt.sd_lamma_virtual_receiver_mode is not None:
+            sd_cfg["broadcast"]["virtual_receiver_mode"] = opt.sd_lamma_virtual_receiver_mode
+        if opt.sd_lamma_learnable_alpha is not None:
+            sd_cfg["broadcast"]["learnable_alpha"] = opt.sd_lamma_learnable_alpha
+        if opt.sd_lamma_learnable_ckpt is not None:
+            sd_cfg["broadcast"]["learnable_ckpt"] = opt.sd_lamma_learnable_ckpt
         if opt.sd_lamma_receiver_gating:
             sd_cfg["broadcast"]["receiver_gating"]["enabled"] = True
         if opt.sd_lamma_save_broadcast_debug:
@@ -268,6 +288,8 @@ def main():
     resume_epoch, model = train_utils.load_saved_model(saved_path, model)
     print(f"resume from {resume_epoch} epoch.")
     opt.note += f"_epoch{resume_epoch}"
+    if load_broadcast_learnable_checkpoint_from_config is not None:
+        load_broadcast_learnable_checkpoint_from_config(model, map_location="cpu")
     
     if torch.cuda.is_available():
         model.cuda()
