@@ -15,7 +15,10 @@ from opencood.models.sub_modules.feature_alignnet import AlignNet
 from opencood.models.sub_modules.base_bev_backbone import BaseBEVBackbone
 from opencood.models.sub_modules.downsample_conv import DownsampleConv
 from opencood.models.sub_modules.naive_compress import NaiveCompressor
-from opencood.tools.sd_lamma import SupplyDemandLAMMAComm
+from opencood.tools.sd_lamma import (
+    BroadcastSupplyDemandLAMMAComm,
+    SupplyDemandLAMMAComm,
+)
 from opencood.models.fuse_modules.fusion_in_one import (
     MaxFusion, AttFusion, DiscoFusion, 
     V2VNetFusion, V2XViTFusion, 
@@ -200,15 +203,26 @@ class PointPillarLSSLamma2PyramidFusion(nn.Module):
 
         self.sd_lamma_enabled = False
         self.sd_lamma_comm = None
+        self.sd_lamma_mode = "pairwise"
         sd_lamma_cfg = args.get("sd_lamma", None)
         if sd_lamma_cfg:
             sd_lamma_cfg = dict(sd_lamma_cfg)
             sd_lamma_cfg.setdefault("lidar_range", self.cav_range)
             sd_lamma_cfg.setdefault("voxel_size", self.voxel_size)
             self.sd_lamma_enabled = bool(sd_lamma_cfg.get("enabled", False))
-            self.sd_lamma_comm = SupplyDemandLAMMAComm(sd_lamma_cfg)
+            self.sd_lamma_mode = str(sd_lamma_cfg.get("mode", "pairwise")).lower()
+            if self.sd_lamma_mode == "broadcast":
+                sd_lamma_cfg.setdefault("broadcast", {})
+                sd_lamma_cfg["broadcast"].setdefault("enabled", True)
+                self.sd_lamma_comm = BroadcastSupplyDemandLAMMAComm(sd_lamma_cfg)
+                sd_lamma_label = "[BROAD-SD-LAMMA]"
+            elif self.sd_lamma_mode == "pairwise":
+                self.sd_lamma_comm = SupplyDemandLAMMAComm(sd_lamma_cfg)
+                sd_lamma_label = "[SD-LAMMA]"
+            else:
+                raise ValueError(f"Unsupported sd_lamma.mode: {self.sd_lamma_mode}")
             if self.sd_lamma_enabled:
-                print("[SD-LAMMA] enabled:", sd_lamma_cfg)
+                print(f"{sd_lamma_label} enabled:", sd_lamma_cfg)
         
         # freeze multi-modal fusion
         setattr(self, f"ma_fusion_freeze", args['fusion_backbone'].get('freeze', False))

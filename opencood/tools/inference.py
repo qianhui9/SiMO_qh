@@ -99,6 +99,20 @@ def test_parser():
                         help="Allow multiple collaborators to fill the same ego BEV region.")
     parser.add_argument("--sd_lamma_save_masks", action="store_true",
                         help="Attach SD-LAMMA demand/supply/selection masks to model debug output.")
+    parser.add_argument("--sd_lamma_mode", default=None,
+                        choices=["pairwise", "broadcast"],
+                        help="Select SD-LAMMA communication mode. Defaults to yaml or pairwise.")
+    parser.add_argument("--sd_lamma_broadcast_enable", action="store_true",
+                        help="Enable BROAD-SD-LAMMA and set sd_lamma.mode=broadcast.")
+    parser.add_argument("--sd_lamma_broadcast_method", default=None,
+                        choices=["soft_or", "vra"],
+                        help="Broadcast demand estimator.")
+    parser.add_argument("--sd_lamma_num_virtual_receivers", type=int, default=None,
+                        help="Number of virtual receiver tokens for BROAD-SD-LAMMA.")
+    parser.add_argument("--sd_lamma_receiver_gating", action="store_true",
+                        help="Enable ego-side local gating after receiving broadcast messages.")
+    parser.add_argument("--sd_lamma_save_broadcast_debug", action="store_true",
+                        help="Save broadcast demand/mask/utility debug tensors.")
     opt = parser.parse_args()
     return opt
 
@@ -179,17 +193,44 @@ def main():
         model_args["light_sad"]["debug_dump_state"] = opt.light_sad_dump_state
         model_args["light_sad"]["debug_dump_path"] = opt.light_sad_dump_path
 
-    if opt.sd_lamma_enable:
+    sd_lamma_cli_requested = any([
+        opt.sd_lamma_enable,
+        opt.sd_lamma_log,
+        opt.sd_lamma_budget_mode is not None,
+        opt.sd_lamma_max_comm_ratio is not None,
+        opt.sd_lamma_demand_topk_ratio is not None,
+        opt.sd_lamma_supply_threshold is not None,
+        opt.sd_lamma_no_redundancy,
+        opt.sd_lamma_allow_overlap,
+        opt.sd_lamma_save_masks,
+        opt.sd_lamma_mode is not None,
+        opt.sd_lamma_broadcast_enable,
+        opt.sd_lamma_broadcast_method is not None,
+        opt.sd_lamma_num_virtual_receivers is not None,
+        opt.sd_lamma_receiver_gating,
+        opt.sd_lamma_save_broadcast_debug,
+    ])
+    if sd_lamma_cli_requested:
         model_args = hypes["model"]["args"]
         sd_cfg = model_args.get("sd_lamma", {})
         model_args["sd_lamma"] = sd_cfg
-        sd_cfg["enabled"] = True
+        if opt.sd_lamma_enable or opt.sd_lamma_broadcast_enable:
+            sd_cfg["enabled"] = True
+        sd_cfg.setdefault("mode", "pairwise")
         sd_cfg.setdefault("network", {})
         sd_cfg.setdefault("demand", {})
         sd_cfg.setdefault("supply", {})
         sd_cfg.setdefault("redundancy", {})
         sd_cfg.setdefault("debug", {})
         sd_cfg.setdefault("mask", {})
+        sd_cfg.setdefault("broadcast", {})
+        sd_cfg["broadcast"].setdefault("receiver_gating", {})
+        sd_cfg["broadcast"].setdefault("debug", {})
+        if opt.sd_lamma_broadcast_enable:
+            sd_cfg["mode"] = "broadcast"
+            sd_cfg["broadcast"]["enabled"] = True
+        if opt.sd_lamma_mode is not None:
+            sd_cfg["mode"] = opt.sd_lamma_mode
         if opt.sd_lamma_budget_mode is not None:
             sd_cfg["network"]["budget_mode"] = opt.sd_lamma_budget_mode
         if opt.sd_lamma_max_comm_ratio is not None:
@@ -202,8 +243,20 @@ def main():
             sd_cfg["redundancy"]["enabled"] = False
         if opt.sd_lamma_allow_overlap:
             sd_cfg["redundancy"]["allow_overlap"] = True
+        if opt.sd_lamma_broadcast_method is not None:
+            sd_cfg["broadcast"]["method"] = opt.sd_lamma_broadcast_method
+            sd_cfg["broadcast"]["use_vra"] = opt.sd_lamma_broadcast_method == "vra"
+        if opt.sd_lamma_num_virtual_receivers is not None:
+            sd_cfg["broadcast"]["num_virtual_receivers"] = opt.sd_lamma_num_virtual_receivers
+        if opt.sd_lamma_receiver_gating:
+            sd_cfg["broadcast"]["receiver_gating"]["enabled"] = True
+        if opt.sd_lamma_save_broadcast_debug:
+            sd_cfg["debug"]["save_masks"] = True
+            sd_cfg["broadcast"]["debug"]["save_broadcast_demand"] = True
+            sd_cfg["broadcast"]["debug"]["save_broadcast_mask"] = True
+            sd_cfg["broadcast"]["debug"]["save_broadcast_utility"] = True
         sd_cfg["debug"]["log"] = opt.sd_lamma_log
-        sd_cfg["debug"]["save_masks"] = opt.sd_lamma_save_masks
+        sd_cfg["debug"]["save_masks"] = opt.sd_lamma_save_masks or sd_cfg["debug"].get("save_masks", False)
 
     print('Creating Model')
     model = train_utils.create_model(hypes)

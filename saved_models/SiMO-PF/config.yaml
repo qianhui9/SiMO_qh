@@ -207,6 +207,7 @@ model:
 
     sd_lamma:
       enabled: false
+      mode: pairwise
       demand:
         use_lidar_density: true
         use_uncertainty: true
@@ -232,6 +233,25 @@ model:
         deadline_ms: null
         packet_loss: null
         frame_rate_hz: 10.0
+      broadcast:
+        enabled: false
+        method: vra
+        num_virtual_receivers: 8
+        virtual_receiver_mode: fixed
+        use_vra: true
+        use_soft_or_fallback: true
+        budget_ratio: 0.3
+        use_modality_reliability: true
+        receiver_gating:
+          enabled: false
+          source: uncertainty
+          min_gate: 0.0
+          strength: 1.0
+        debug:
+          save_broadcast_demand: false
+          save_broadcast_mask: false
+          save_broadcast_utility: false
+          save_receiver_gating: false
       redundancy:
         enabled: true
         demand_decay: 1.0
