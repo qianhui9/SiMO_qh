@@ -1,6 +1,6 @@
 # BROAD-SD-LAMMA 模块设计与实现说明
 
-本文档说明当前仓库中 `BROAD-SD-LAMMA: Broadcast-compatible Supply-Demand LAMMA Communication` 的设计目标、模块结构、核心算法、代码接入方式、配置项、调试字段和运行命令。
+本文档说明当前仓库中 `BROAD-SD-LAMMA: Broadcast-compatible Supply-Demand LAMMA Communication` 的统一研究设计，包括 sender-side broadcast mask、Virtual Receiver Attention、learnable VRA 的 Pairwise Teacher 蒸馏训练、代码接入方式、配置项、调试字段和运行命令。
 
 ## 1. 设计背景
 
@@ -35,26 +35,29 @@ BROAD-SD-LAMMA 遵守以下原则：
 
 ## 3. 新增文件与职责
 
-新增文件如下：
+核心新增与扩展文件如下：
 
 ```text
 opencood/tools/sd_lamma/
 ├── broadcast_comm.py
+├── broadcast_distill.py
 ├── virtual_receiver.py
-└── BROAD_SD_LAMMA_DESIGN.md
+├── BROAD_SD_LAMMA_DESIGN.md
+└── BROAD_SD_LAMMA_DISTILL.md        # 旧的蒸馏说明入口，核心内容已合并到本文档
+
+opencood/tools/
+└── train_broad_sd_lamma_distill.py
 ```
 
-`virtual_receiver.py` 定义 `VirtualReceiverAttention`，负责从 sender BEV feature 中估计 receiver-agnostic broadcast demand `D_j^B`。
+`virtual_receiver.py` 定义 `VirtualReceiverAttention`，负责从 sender BEV feature 中估计 receiver-agnostic broadcast demand `D_j^B`。它同时支持 `fixed` 和 `learnable` 两种 token 参数化：fixed 模式只使用几何先验；learnable 模式在固定先验上学习小幅 `delta_v_k`、temperature delta 和 prior scale。
 
-`broadcast_comm.py` 定义 `BroadcastSupplyDemandLAMMAComm`，它继承 `SupplyDemandLAMMAComm`，复用原模块中已有的 confidence 构造、Light-SAD reliability 解析、预算估计、Top-K 选择、sparse debug 等工具，但改变 mask 生成语义：从 pair-wise receiver-conditioned mask 改为 sender-side broadcast mask。
+`broadcast_comm.py` 定义 `BroadcastSupplyDemandLAMMAComm`，它继承 `SupplyDemandLAMMAComm`，复用原模块中已有的 confidence 构造、Light-SAD reliability 解析、预算估计、Top-K 选择、sparse debug 等工具，但改变 mask 生成语义：从 pair-wise receiver-conditioned mask 改为 sender-side broadcast mask。训练时它还能在 `broadcast.distill.enabled=true` 时返回 `distill_loss_total` 和 teacher/student 统计。
 
-`__init__.py` 导出：
+`broadcast_distill.py` 定义 `BroadcastDistillationLoss`、BROAD-SD-LAMMA learnable checkpoint 保存/加载工具，以及冻结主干、筛选 VRA 轻量可训练参数的工具函数。
 
-```python
-from .broadcast_comm import BroadcastSupplyDemandLAMMAComm
-from .comm import SupplyDemandLAMMAComm
-from .virtual_receiver import VirtualReceiverAttention
-```
+`train_broad_sd_lamma_distill.py` 是专门的 Pairwise Teacher 蒸馏训练入口。它加载原 SiMO-PF checkpoint，打开 broadcast learnable VRA，默认冻结 SiMO 主干，只优化 BROAD-SD-LAMMA 的轻量 learnable 参数，并保存 lightweight checkpoint。
+
+`__init__.py` 导出通信模块、VRA、distillation loss、checkpoint 和参数冻结工具。
 
 ## 4. 整体数据流
 
@@ -337,9 +340,113 @@ packets_per_sender_max = 1
 
 这些字段用于证明 broadcast 模式的通信量不会按 receiver 数量重复计算。
 
-## 8. Ego-side Receiver Gating
+## 8. Learnable VRA 的 Pairwise Teacher 蒸馏训练设计
 
-### 8.1 设计动机
+前面几节定义了 BROAD-SD-LAMMA 的推理语义：sender 在 LAMMA 后统一 BEV 空间中，根据自身 supply、receiver-agnostic broadcast demand 和 sender-side budget 生成唯一 `M_j^B`。这一设计已经保证 broadcast-compatible，但 fixed VRA 仍只依赖人工设置的几何先验。为了让虚拟接收方 token 从数据中学习更有效的 broadcast prior，本文档将 `BROAD_SD_LAMMA_DISTILL.md` 中的蒸馏训练机制合并为 BROAD-SD-LAMMA 方法设计的一部分。
+
+### 8.1 研究问题：从 receiver-specific expert 到 sender-side broadcast student
+
+原 pairwise SD-LAMMA 可以看作一个 receiver-specific expert。它读取当前 ego 的 demand map `D_i`，并与 sender supply `S_j` 结合，得到面向当前 ego 的定制 mask：
+
+```text
+M_{j->i}^T = f_T(D_i, S_j, Z_j)
+```
+
+这个 teacher 在单 ego evaluation 下通常更接近当前 receiver 的最优通信选择，但它不满足 broadcast 通信假设。BROAD-SD-LAMMA 的 student 必须满足：
+
+```text
+M_j^B = f_B(Z_j, S_j, V)
+```
+
+其中 `V` 是虚拟接收方 token 集合，student forward 不能读取当前 ego 的完整 demand map，也不能为不同 receiver 生成不同 mask。蒸馏训练的核心思想不是让 student 复制 teacher 的 receiver-conditioned 决策，而是利用 teacher 暴露的高价值区域训练一个 receiver-agnostic 的 broadcast prior。换句话说，teacher 提供监督，student 保持广播语义。
+
+### 8.2 Learnable Virtual Receiver Token：固定几何先验上的小幅可学习修正
+
+learnable VRA 的 token 不是任意自由 embedding，而是在 fixed 几何先验 `v_k^0` 上做受限修正：
+
+```text
+v_k = v_k^0 + tanh(delta_v_k) * alpha
+```
+
+这里 `v_k^0 = [dx_k, dy_k, rho_k, pi_k]` 表示虚拟 receiver 的方向、距离和重要性先验；`delta_v_k` 初始化为 0；`alpha` 默认取 0.1，用来限制 token 只能在几何先验附近微调。论文上这一参数化有三个作用：
+
+- 保留 interpretability：token 仍对应 front、side、rear 等潜在接收方方向，而不是无结构 latent vector。
+- 保证 safe fallback：没有 learnable checkpoint 时，learnable 模式近似 fixed 模式。
+- 控制可训练容量：默认只学习 token delta、temperature delta 和 prior scale，避免把结果归因混入主干网络重训练。
+
+因此，learnable VRA 可以被描述为一个 data-calibrated receiver distribution surrogate。它利用 pairwise teacher 的训练信号校准虚拟接收方分布，但不改变 broadcast inference 时的输入依赖。
+
+### 8.3 Teacher Export：复用原 pairwise SD-LAMMA 而不是重写 teacher
+
+teacher mask 由 `SupplyDemandLAMMAComm.export_pairwise_teacher()` 导出。该接口复用原 pairwise SD-LAMMA 的 confidence、demand、supply、budget、warp 和 `_mask_one_sample` 逻辑，返回：
+
+```text
+teacher_mask:    M_{j->ego}^T
+teacher_utility: sender 坐标系下的 soft teacher utility
+teacher_selected_ratio
+teacher_selected_cells
+```
+
+teacher 运行在 no-grad/eval 语义下，只提供监督张量，不参与反向传播。这样可以避免实现两套不一致的 teacher mask 生成器，也避免 teacher 逻辑污染普通 pairwise 推理路径。若某个 batch 中 teacher 不可用，训练会退化为 budget / invariance 约束并打印 warning，而不是直接破坏 broadcast forward。
+
+### 8.4 非对称 Coverage Loss：覆盖 teacher 重要区域，而非逐像素复制 teacher
+
+由于 teacher 是 ego-specific，而 student 是 receiver-agnostic，二者的目标并不完全一致。若强制逐像素复制 teacher，student 会学习当前 ego 的偏置，并重新滑向 receiver-conditioned mask。因此蒸馏采用非对称 coverage loss：
+
+```text
+teacher important but student not covered -> penalty
+student selected outside teacher region     -> not directly penalized by coverage
+```
+
+实现中默认用 hard teacher mask 或 teacher utility 表示 teacher 重要区域，用 student 的 soft broadcast utility 或 demand 作为可微 student score。这样 coverage loss 鼓励 `M_j^B` 覆盖 pairwise expert 认为关键的区域，但允许 broadcast student 为潜在其他 receiver 保留额外区域。这个设计正是 broadcast-compatible 学习的关键：student 不是 teacher 的压缩复制，而是 receiver-specific evidence 诱导出的 sender-side prior。
+
+### 8.5 Budget 与 Invariance：避免全选退化并稳定 broadcast prior
+
+蒸馏训练存在一个直接退化解：student 为了覆盖 teacher 高分区域，把 `M_j^B` 扩大到接近全选。为此，总损失加入 sender-side budget regularization：
+
+```text
+L_budget = ReLU(r_student - B_j)^2
+```
+
+其中 `r_student` 是 student soft selected ratio，`B_j` 是 sender-side broadcast budget。该 budget 与第 7 节的通信定义一致，约束的是每个 sender 一帧广播的 BEV cell 比例，而不是为某个 ego 定制的 pairwise 通信总量。
+
+可选 invariance loss 通过 token dropout、prior jitter 或 small noise 生成两次 broadcast demand，并约束二者差异。它的论文意义是让 learnable virtual receiver token 学到稳定的 receiver distribution surrogate，而不是对个别 token 或个别 ego 样本过拟合。默认该项权重较小，避免抑制有效学习。
+
+最终蒸馏目标为：
+
+```text
+L = lambda_cover * L_cover
+  + lambda_budget * L_budget
+  + lambda_inv * L_inv
+  + lambda_det * L_det
+```
+
+其中 `lambda_det` 默认是 0。第一阶段只做 teacher distillation；后续可选 detection fine-tuning 仍默认冻结主干，只更新 BROAD-SD-LAMMA learnable 参数。
+
+### 8.6 训练边界与论文消融逻辑
+
+默认训练边界非常保守：冻结 LiDAR encoder、Camera encoder、aligner、LAMMA、Pyramid Fusion、Detection Head、Light-SAD 和原 pairwise SD-LAMMA，仅训练 `VirtualReceiverAttention` 中的 token delta、temperature delta 和 prior scale。这一设置让论文中的消融逻辑更干净：
+
+- `fixed`：无需训练的 geometry-prior broadcast baseline。
+- `learnable`：通过 pairwise teacher distillation 学到的数据校准 broadcast token。
+- `learnable + detection fine-tuning`：可选第二阶段，用 detection loss 做任务级微调。
+
+因此，若 learnable 相比 fixed 有提升，主要可以归因于 virtual receiver prior 的学习，而不是主干表征能力变化。若通信统计中 `packets_per_sender_max` 始终等于 1，则说明训练没有破坏 sender-side broadcast mask 的核心语义。
+
+### 8.7 Lightweight Checkpoint 与推理加载
+
+蒸馏训练不覆盖原 SiMO-PF checkpoint，只保存 BROAD-SD-LAMMA learnable 参数的轻量 checkpoint：
+
+```text
+broad_sd_lamma_learnable_epoch*.pth
+broad_sd_lamma_learnable_latest.pth
+```
+
+checkpoint 内容包括 `virtual_receiver_state_dict`、`broadcast_comm_state_dict` 中的 `virtual_receiver.*`、配置摘要、epoch / iteration 和 loss 统计。推理时先加载原 `saved_models/SiMO-PF`，再加载 `broadcast.learnable_ckpt`。若 `virtual_receiver_mode=learnable` 但没有提供 checkpoint，`delta_v_k=0` 会让行为退化为 fixed-like 初始化，并打印明确日志。
+
+## 9. Ego-side Receiver Gating
+
+### 9.1 设计动机
 
 Broadcast message 是 sender-side 一次性生成的，不能随当前 ego 改变；但在单 ego evaluation 中，当前 ego 对不同区域的需求仍然不同。如果完全不考虑 ego 状态，广播消息中某些区域可能对当前 ego 帮助有限。Ego-side Receiver Gating 的目标是在不破坏 broadcast 语义的前提下，让 ego 本地决定如何利用已收到的 `P_j^B`。
 
@@ -351,7 +458,7 @@ receiver gating 只能改变 ego 如何使用 P_j^B，不能改变 sender 已广
 
 因此它是 receive-side feature modulation，而不是 sender-side communication scheduling。
 
-### 8.2 gating map 的构造
+### 9.2 gating map 的构造
 
 当前实现支持两种来源：
 
@@ -377,7 +484,7 @@ G_i(r) = Conf_i(r)
 
 `Conf_i` 与 supply 一样，优先来自 pre-fusion confidence head；若不可用，则回退到 feature energy proxy。
 
-### 8.3 坐标变换与作用位置
+### 9.3 坐标变换与作用位置
 
 Pyramid Fusion 会在内部将各 CAV 特征 warp 到 ego 坐标系进行融合。为了不改变 Pyramid Fusion 接口，当前实现将 ego gating map 反向 warp 到 sender 特征所在坐标系，然后作用在已经 masked 的 sender dense feature 上：
 
@@ -394,7 +501,7 @@ P_j^B = Z_j * M_j^B
 
 因此 gating 不计入 sender packet 数，也不改变 `estimated_broadcast_payload_kbits`。
 
-### 8.4 gate 强度与下界
+### 9.4 gate 强度与下界
 
 为了避免 gating 过强导致接收特征被完全抑制，配置提供两个稳定性参数：
 
@@ -418,7 +525,7 @@ G_final = (1 - strength) + strength * G_prime
 
 当 `strength=0` 时，receiver gating 等价于关闭；当 `strength=1` 时，完全使用 gating map；`min_gate>0` 则保证每个位置至少保留一定比例的接收特征。
 
-### 8.5 论文中的语义边界
+### 9.5 论文中的语义边界
 
 在论文表述中，Ego-side Receiver Gating 应被描述为 local selective fusion，而不是 communication mask generation。它解决的是“当前 ego 如何消费一份广播消息”的问题，而不是“sender 应该为当前 ego 发什么”的问题。
 
@@ -429,7 +536,7 @@ G_final = (1 - strength) + strength * G_prime
 - `sender_packet_count` 和 payload 只统计 sender-side broadcast mask；
 - receiver gating 不影响 `M_j^B`，不影响 packet count。
 
-## 9. 与 pairwise SD-LAMMA 的模式切换
+## 10. 与 pairwise SD-LAMMA 的模式切换
 
 主模型接入位于：
 
@@ -455,7 +562,7 @@ else:
 - `sd_lamma.enabled=false` 时，主模型不调用通信模块。
 - `sd_lamma.enabled=true` 且 `mode=broadcast` 时，才启用 BROAD-SD-LAMMA。
 
-## 10. CLI 覆盖
+## 11. CLI 覆盖
 
 推理脚本新增参数位于：
 
@@ -481,7 +588,7 @@ opencood/tools/inference.py
 - `--sd_lamma_broadcast_method soft_or` 会设置 `use_vra=false`。
 - `--sd_lamma_save_broadcast_debug` 会保存 broadcast demand / mask / utility tensor，默认不保存大 tensor。
 
-## 11. Debug 输出
+## 12. Debug 输出
 
 Broadcast 模式下 `sd_lamma_debug` 重点字段包括：
 
@@ -536,7 +643,7 @@ sparse_shape
 
 第一版仍不把 Pyramid Fusion 输入替换为 sparse tensor，只用于检查未来 sparse serialization 的等价性。
 
-## 12. Pairwise Teacher Overlap
+## 13. Pairwise Teacher Overlap 与蒸馏监督
 
 Broadcast 模式提供可选 teacher overlap 统计，默认关闭。
 
@@ -562,9 +669,9 @@ sd_lamma:
 pairwise_teacher_overlap = |M_j^B ∩ M_{j->ego}^T| / |M_{j->ego}^T|
 ```
 
-这只是 debug / ablation 接口，不参与 loss，不强依赖 teacher，因此 teacher 关闭时 broadcast forward 不受影响。
+在普通推理中，这只是 debug / ablation 接口，不参与 loss，不强依赖 teacher，因此 teacher 关闭时 broadcast forward 不受影响。在 `broadcast.distill.enabled=true` 的训练路径中，同一类 pairwise teacher export 会进一步作为 coverage loss 的监督来源，但 teacher 输出仍只进入 loss，不作为 student forward 输入。
 
-## 13. 配置示例
+## 14. 配置示例
 
 默认配置已经加入：
 
@@ -598,10 +705,33 @@ sd_lamma:
     method: vra
     num_virtual_receivers: 8
     virtual_receiver_mode: fixed
+    learnable_alpha: 0.1
+    learnable_temperature: true
+    learnable_prior_scale: true
+    prior_scale_alpha: 0.25
+    learnable_ckpt: null
     use_vra: true
     use_soft_or_fallback: true
     budget_ratio: 0.3
     use_modality_reliability: true
+    distill:
+      enabled: false
+      teacher_mode: pairwise
+      freeze_backbone: true
+      trainable_scope: virtual_receiver
+      use_detection_loss: false
+      lambda_cover: 1.0
+      lambda_budget: 0.1
+      lambda_inv: 0.05
+      lambda_det: 0.0
+      teacher_score_type: mask
+      student_score_type: utility
+      hard_topk_for_loss: false
+      token_dropout: 0.0
+      token_noise_std: 0.0
+      max_train_iters: null
+      log_interval: 20
+      save_interval: 1
     receiver_gating:
       enabled: false
       source: uncertainty
@@ -621,7 +751,7 @@ sd_lamma:
     save_masks: false
 ```
 
-## 14. 最小运行命令
+## 15. 最小运行命令
 
 进入项目和环境：
 
@@ -636,8 +766,10 @@ conda activate SiMO_qh
 python -m py_compile \
   opencood/tools/sd_lamma/comm.py \
   opencood/tools/sd_lamma/virtual_receiver.py \
+  opencood/tools/sd_lamma/broadcast_distill.py \
   opencood/tools/sd_lamma/broadcast_comm.py \
   opencood/models/point_pillar_lss_lamma2_pyramid_fusion.py \
+  opencood/tools/train_broad_sd_lamma_distill.py \
   opencood/tools/inference.py
 ```
 
@@ -707,16 +839,56 @@ python opencood/tools/inference.py \
   --light_sad_max_batches 2
 ```
 
-## 15. 实现边界
+Learnable VRA 蒸馏 dry-run：
+
+```bash
+python opencood/tools/train_broad_sd_lamma_distill.py \
+  --hypes_yaml opencood/hypes_yaml/opv2v/MoreModality/lidar_camera_lamma3_pyramid_fusion.yaml \
+  --model_dir saved_models/SiMO-PF \
+  --sd_lamma_max_comm_ratio 0.3 \
+  --broad_sd_dry_run \
+  --broad_sd_max_train_iters 2 \
+  --broad_sd_log_interval 1
+```
+
+正式 Pairwise Teacher 蒸馏：
+
+```bash
+python opencood/tools/train_broad_sd_lamma_distill.py \
+  --hypes_yaml opencood/hypes_yaml/opv2v/MoreModality/lidar_camera_lamma3_pyramid_fusion.yaml \
+  --model_dir saved_models/SiMO-PF \
+  --sd_lamma_max_comm_ratio 0.3 \
+  --sd_lamma_learnable_alpha 0.1 \
+  --broad_sd_lambda_cover 1.0 \
+  --broad_sd_lambda_budget 0.1 \
+  --broad_sd_lambda_inv 0.05
+```
+
+加载 learnable checkpoint 推理：
+
+```bash
+python opencood/tools/inference.py \
+  --model_dir saved_models/SiMO-PF \
+  --fusion_method intermediate \
+  --sd_lamma_broadcast_enable \
+  --sd_lamma_broadcast_method vra \
+  --sd_lamma_virtual_receiver_mode learnable \
+  --sd_lamma_learnable_ckpt opencood/logs/<run>/broad_sd_lamma_learnable_latest.pth \
+  --sd_lamma_max_comm_ratio 0.3 \
+  --sd_lamma_log \
+  --light_sad_max_batches 2
+```
+
+## 16. 实现边界
 
 当前版本已经完成 broadcast-compatible 的主路径，但仍保持第一版工程边界：
 
 - Pyramid Fusion 输入仍为 dense tensor，没有改成 sparse tensor。
 - `C_j(r)` 暂设为 1.0，没有加入复杂区域代价模型。
-- VRA 可 forward，但若要作为 learnable 模块充分发挥效果，后续仍需要训练或蒸馏。
-- pairwise teacher overlap 仅作为 debug 统计，尚未扩展为训练 loss。
-- 当前仍保持单 ego evaluation，broadcast 语义通过 sender-side mask 与 debug packet count 体现。
+- learnable VRA 已支持 Pairwise Teacher 蒸馏，但默认关闭；只有 `broadcast.distill.enabled=true` 或专用训练脚本会计算 distillation loss。
+- teacher 可以使用 ego demand 生成监督 mask，但 teacher 输出只进入 loss/debug，不进入 student forward，也不改变 broadcast 推理语义。
+- 当前仍保持单 ego evaluation，broadcast 语义通过 sender-side mask 与 `packets_per_sender_max=1` 体现。
 
-## 16. 一句话总结
+## 17. 一句话总结
 
-BROAD-SD-LAMMA 在 LAMMA 统一 BEV 空间中，用虚拟接收方注意力估计 sender-side broadcast demand，并结合 sender supply、Light-SAD modality reliability 与 sender-side budget 生成唯一 broadcast mask `M_j^B`。当前 ego 可以本地 gating 接收后的 dense feature，但不能改变 sender 已广播的消息，从而在不破坏原始 SiMO-PF 和 pairwise SD-LAMMA 的前提下，引入符合广播通信假设的供需通信模式。
+BROAD-SD-LAMMA 在 LAMMA 统一 BEV 空间中，用虚拟接收方注意力估计 sender-side broadcast demand，并结合 sender supply、Light-SAD modality reliability 与 sender-side budget 生成唯一 broadcast mask `M_j^B`。fixed VRA 提供无需训练的几何先验 baseline；learnable VRA 通过 pairwise SD-LAMMA teacher 蒸馏校准虚拟接收方 token，但仍不读取当前 ego demand、不生成 per-receiver packet。当前 ego 可以本地 gating 接收后的 dense feature，但不能改变 sender 已广播的消息，从而在不破坏原始 SiMO-PF 和 pairwise SD-LAMMA 的前提下，引入符合广播通信假设的供需通信模式。
